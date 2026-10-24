@@ -209,6 +209,36 @@ def _cmd_boards_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_merge(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_merge
+
+    try:
+        res = kanban_merge.merge_board(
+            args.source_db,
+            source_board=args.from_board,
+            snapshot=args.snapshot,
+            board=getattr(args, "board", None) or None,
+            dry_run=args.dry_run,
+        )
+    except (OSError, ValueError) as exc:
+        return _err(f"kanban boards merge: {exc}")
+    if _json_out(args, res):
+        return 0
+    counts = res["counts"]
+    verb = "Would import" if res["dry_run"] else "Imported"
+    print(f"{verb} {counts['tasks']} task(s) from board {res['source_board']!r} "
+          f"(snapshot {res['snapshot']!r}) into {res['board']!r}.")
+    print(f"  Events copied:   {counts['task_events']}\n"
+          f"  Imported marks:  {counts['imported_events']}\n"
+          f"  Comments:        {counts['task_comments']}\n"
+          f"  Runs:            {counts['task_runs']}\n"
+          f"  Links:           {counts['task_links']}\n"
+          f"  Already present: {res['skipped']}")
+    for warning in res["warnings"]:
+        print(f"  Note:  {warning}")
+    return 0
+
+
 _BOARD_HANDLERS = {
     "list": _cmd_boards_list, "ls": _cmd_boards_list,
     "create": _cmd_boards_create, "new": _cmd_boards_create,
@@ -219,4 +249,5 @@ _BOARD_HANDLERS = {
     "set-default-workdir": _cmd_boards_set_default_workdir,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
+    "merge": _cmd_boards_merge,
 }

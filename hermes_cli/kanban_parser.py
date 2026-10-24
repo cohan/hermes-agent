@@ -144,6 +144,22 @@ _BOARD_SPECS = [
         "NEW board — the slug gains a numeric suffix if it is already taken — so an import can "
         "never overwrite or merge into a board you already have."
     )),
+    _cmd("merge", [
+        _arg("source_db", help="Path to the source kanban.db (or a snapshot of it)"),
+        _arg("--from-board", dest="from_board", required=True,
+             help="Slug recorded as the source board on every imported event"),
+        _arg("--snapshot", help="Snapshot label recorded on every imported event (default: the file name)"),
+        _arg("--dry-run", action="store_true", dest="dry_run",
+             help="Report what would be imported; write nothing"),
+        _json_flag(),
+    ], help="Merge another board's tasks into a board, preserving event history", description=(
+        "Copy every task from another board's database that this board does not already have, "
+        "with its event trail, comments, runs and links. Each imported task gains one 'imported' "
+        "event naming the source board, the snapshot and the task's original created_at. Columns "
+        "that only describe the source machine (claims, PIDs, session ids, workspace paths) are "
+        "dropped, and tasks whose workspace cannot be rebuilt here are parked in triage. "
+        "Idempotent: a task id already on this board is left untouched, so a re-run adds nothing."
+    )),
 ]
 
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
