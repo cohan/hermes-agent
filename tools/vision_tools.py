@@ -778,10 +778,18 @@ def _media_messages(user_prompt: str, part_type: str, data_url: str) -> list:
 
 # Aux-LLM error classification: first matching hint set wins (billing → capability → size/format).
 _BILLING_HINTS = ("402", "insufficient", "payment required", "credits", "billing")
+# A 429 is not a fault to work around: the fair-share window is spent and the honest answer is
+# "try again later" (the provider's own retry_after rides in {e} when it named one).
+_RATE_LIMIT_HINTS = ("429", "rate limit", "rate_limit", "rate-limited", "too many requests",
+                     "fair-share", "fairshare")
+_RATE_LIMIT_COPY = (
+    "The vision provider is rate-limited right now, so this image was not analysed. "
+    "Try again later rather than retrying immediately. Error: {e}")
 _IMAGE_ERROR_RULES = (
     (_BILLING_HINTS,
      "Insufficient credits or payment required. Please top up your "
      "API provider account and try again. Error: {e}"),
+    (_RATE_LIMIT_HINTS, _RATE_LIMIT_COPY),
     (("does not support", "not support image", "content_policy", "multimodal",
       "unrecognized request argument", "image input"),
      "{model} does not support vision or our request was not "
@@ -794,6 +802,7 @@ _IMAGE_ERROR_RULES = (
 )
 _VIDEO_ERROR_RULES = (
     (_BILLING_HINTS, _IMAGE_ERROR_RULES[0][1]),
+    (_RATE_LIMIT_HINTS, _RATE_LIMIT_COPY),
     (("does not support", "not support video", "content_policy", "multimodal",
       "unrecognized request argument", "video input", "video_url"),
      "The model does not support video analysis or the request was "

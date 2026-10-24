@@ -31,6 +31,7 @@ from agent.error_classifier import (
     is_reasoning_field_rejection,
     is_reasoning_required_rejection,
 )
+from agent.auxiliary_rate_limit import credential_rung_accepts, rate_limit_verdict
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
 from agent.auxiliary_structured_output import remember_structured_output_rejection
 from agent.codex_headers import (
@@ -7605,10 +7606,6 @@ def _param_rung_accepts(exc: Exception) -> bool:
             or _is_model_incompatible_error(exc))
 
 
-def _credential_rung_accepts(exc: Exception) -> bool:
-    return _is_auth_error(exc) or _is_payment_error(exc) or _is_rate_limit_error(exc)
-
-
 # Immutable route context shared by the recovery rungs.
 class _LadderRoute(NamedTuple):
     client: Any
@@ -7752,7 +7749,7 @@ def _ladder_nous_rungs(
             "Auxiliary %s%s: refreshed Nous runtime credentials after paid account check, retrying")
         if step is not None:
             resp, first_err = yield from _rung(
-                step, lambda exc: _credential_rung_accepts(exc) or _is_connection_error(exc))
+                step, lambda exc: credential_rung_accepts(exc) or _is_connection_error(exc))
             if first_err is None:
                 return resp, None
     if _is_auth_error(first_err) and client_is_nous:
@@ -7760,7 +7757,7 @@ def _ladder_nous_rungs(
             route, kwargs, "Auxiliary %s%s: refreshed Nous runtime credentials after 401, retrying")
         if step is not None:
             resp, first_err = yield from _rung(
-                step, lambda exc: _credential_rung_accepts(exc) or _is_connection_error(exc))
+                step, lambda exc: credential_rung_accepts(exc) or _is_connection_error(exc))
             if first_err is None:
                 return resp, None
     return None, first_err
@@ -7789,7 +7786,7 @@ def _ladder_credential_rungs(
                 "retry_same_provider",
                 (auth_refresh_provider, route.resolved_model or route.final_model))
             resp, first_err = yield from _rung(
-                step, lambda exc: _credential_rung_accepts(exc) or _is_connection_error(exc))
+                step, lambda exc: credential_rung_accepts(exc) or _is_connection_error(exc))
             if first_err is None:
                 return resp, None
             # ``first_err`` is now the retry's own failure, not the original auth error: the
@@ -7803,13 +7800,16 @@ def _ladder_credential_rungs(
     # Gate on the narrowed error: a connection failure from the retry above arrives here
     # unaccepted on purpose (a fresh key cannot fix an unreachable endpoint), so rotation
     # is skipped and ``first_err`` is handed to the provider-fallback chain as-is.
-    if pool_provider and _credential_rung_accepts(first_err):
+    rate_limited, cooldown, nous_cooling = rate_limit_verdict(
+        first_err, task=task, tag=tag, client=client,
+        client_is_nous=client_is_nous, resolved_api_key=route.resolved_api_key)
+    if pool_provider and credential_rung_accepts(first_err) and not nous_cooling:
         recovery_err = first_err
         # Skip the extra retry for clear payment/quota errors — the endpoint won't accept
         # another request with the same exhausted key.
-        if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
+        if rate_limited and cooldown is None:
             resp, recovery_err = yield from _rung(
-                _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
+                _LadderStep("call", (client, kwargs)), credential_rung_accepts)
             if recovery_err is None:
                 return resp, None
         if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
