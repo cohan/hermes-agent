@@ -10,10 +10,41 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any
 from typing import Optional
 from pathlib import Path
+
+from hermes_cli import kanban_quiesce as _quiesce
+
+
+def _refuse_if_held(normed: str, db_path: Path, *, action: str, command: str) -> None:
+    """Refuse an operation that would move/replace the file under a live holder.
+
+    ``remove_board`` renames the board *directory*, and ``create_board`` runs a
+    schema pass on an existing board; either one under another process's open
+    handle is the #90950 split brain — that process keeps writing the old inode
+    (or a path that no longer resolves) and a later ``connect()`` recreates an
+    empty ``kanban.db``.
+
+    ``live_holders`` returns ``None`` when the ``/proc`` scan cannot run; that
+    is "cannot prove quiesced" and must fail closed, never be read as "free".
+    """
+    holders = _quiesce.live_holders(db_path)
+    if holders is None:
+        raise ValueError(
+            f"refusing to {action} board {normed!r}: this host's /proc scan is "
+            f"unavailable, so it cannot be proved that no process holds "
+            f"{db_path.name} open. Run this on the host that owns the board."
+        )
+    if holders:
+        raise ValueError(
+            f"refusing to {action} board {normed!r}: {db_path.name} or its "
+            f"WAL/SHM is still held open by PID(s) "
+            f"{', '.join(str(pid) for pid in sorted(holders))}. Stop them "
+            f"(`hermes gateway stop`) and re-run: {command}"
+        )
 
 
 def _dir_holds_board(d: Path) -> bool:
@@ -100,13 +131,84 @@ def write_board_metadata(
     return meta
 
 
+def _forget_live_board(normed: str, board_dir: Path) -> None:
+    """Drop the current-board pointer and schema cache *after* the path is gone.
+
+    Both must happen only once the rename has succeeded: clearing the pointer
+    before a rename that then fails would leave the user on ``default`` with
+    the board still present, and dropping the cache early lets a concurrent
+    ``connect()`` re-run the schema pass against the old inode.
+    """
+    if _kb.get_current_board() == normed:
+        _kb.clear_current_board()
+    _kb._INITIALIZED_PATHS.discard(str((board_dir / "kanban.db").resolve()))
+
+
+def _assert_board_quiesced(normed: str, db_path: Path, *, action: str, command: str) -> None:
+    """Refuse board lifecycle mutations while the board is busy or held open.
+
+    Two independent gates, both fail-closed:
+
+    * ``assert_path_quiesced`` names every card that is ``running`` or still
+      holds a ``claim_lock`` — moving or replacing the file under it would
+      convert a live run to ``released`` and lose the worker's claim.
+    * ``_refuse_if_held`` catches a gateway/worker that merely holds the file
+      open with no in-flight card; a rename under that handle is the #90950
+      split brain (the holder keeps writing a deleted inode and a later
+      ``connect()`` recreates an empty board).
+    """
+    _quiesce.assert_path_quiesced(
+        db_path, board_label=f"board {normed!r}", command=command, action=action,
+    )
+    _refuse_if_held(normed, db_path, action=action, command=command)
+
+
+def _create_db_atomically(db_path: Path) -> None:
+    """Build a brand-new board DB in a staging file, then publish by rename.
+
+    The live path is never opened for a schema pass: ``init_db`` runs against
+    the staging copy, ``publish`` integrity-checks it and ``os.replace``s it
+    into place. Nothing ``cp``/``mv``s over an existing live file and no
+    sidecar is unlinked by hand — the staging artifacts are cleaned up by
+    ``discard_staging`` after the rename.
+    """
+    staging = _quiesce.staging_path(db_path)
+    try:
+        _kb.init_db(db_path=staging)
+        _quiesce.publish(staging, db_path, board_label=f"board {db_path.parent.name!r}")
+    finally:
+        _quiesce.discard_staging(staging)
+
+
 def create_board(
     slug: str, *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> dict:
-    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata)."""
+    """Create board dir + DB + metadata (``mkdir -p`` semantics: existing board returns its metadata).
+
+    The DB is only ever *built* in a staging file and published by atomic
+    rename. An existing, non-empty DB is not opened or migrated here at all:
+    ``create_board`` on a live board is a metadata-only write. That keeps the
+    ``hermes kanban boards create <existing>`` path from becoming a second
+    schema writer against a file the dispatcher is using (#35240).
+    """
     normed = _kb._require_slug(slug)
+    db_path = _kb.kanban_db_path(normed)
+    board_dir = _kb.board_dir(normed)
+    exists = _dir_holds_board(board_dir)
+    has_live_db = db_path.exists() and db_path.stat().st_size > 0
+
+    if exists and has_live_db:
+        # Re-creating an existing board is a metadata refresh only. Touching
+        # the DB (init/migration) while another process holds it is a second
+        # writer outside the dispatcher's discipline, so refuse rather than
+        # open it.
+        _assert_board_quiesced(
+            normed, db_path,
+            action="re-create",
+            command=f"hermes kanban boards create {normed}",
+        )
     # Explicit creation clears any archived tombstone at this slug (left by
     # remove_board(archive=True)) — otherwise _kb.init_db() below would rightly
     # refuse to recreate the archived board's DB (#43243).
@@ -114,8 +216,11 @@ def create_board(
         normed, name=name, description=description, icon=icon, color=color,
         default_workdir=default_workdir, project_id=project_id, archived=False,
     )
-    # Touch the DB so list_boards() sees it immediately.
-    _kb.init_db(board=normed)
+    if not has_live_db:
+        # New board, or a stub whose ``kanban.db`` is missing/zero bytes: build
+        # the schema in staging and publish it atomically. list_boards() sees
+        # the DB immediately after the rename.
+        _create_db_atomically(db_path)
     return meta
 
 
@@ -154,13 +259,19 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if _kb.get_current_board() == normed:
-        _kb.clear_current_board()
-
-    # A concurrent connect() after the rename recreates an empty DB file; drop
-    # the init cache first so the schema pass re-runs on it.
-    _kb._INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+    db_path = _kb.kanban_db_path(normed)
+    action = "archive" if archive else "delete"
+    command = f"hermes kanban boards rm {normed}" + ("" if archive else " --delete")
+    # Both modes replace or remove the board's directory — and with it the
+    # ``kanban.db`` inode and its ``-wal``/``-shm``. A card that is still
+    # running would keep writing through the old handle while the path stops
+    # resolving; a later ``connect(board=slug)`` then creates an empty DB. The
+    # quiesce gate names the blocking cards, and the holder scan catches a
+    # gateway/worker that holds the file without an in-flight card.
+    _quiesce.assert_path_quiesced(
+        db_path, board_label=f"board {normed!r}", command=command, action=action,
+    )
+    _refuse_if_held(normed, db_path, action=action, command=command)
 
     if archive:
         # Capture display metadata before the move so the tombstone below keeps
@@ -175,6 +286,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
             target = archive_root / f"{normed}-{ts}-{suffix}"
             suffix += 1
         d.rename(target)
+        _forget_live_board(normed, d)
         # Leave an ``archived`` tombstone at the original slug. Stale dashboard
         # tabs / gateway pollers can keep calling connect(board=slug) after the
         # archive; without a marker the resurrect-guard cannot tell an archived
@@ -191,7 +303,21 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         )
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     import shutil
-    shutil.rmtree(d)
+    # Delete by rename first, then remove the already-detached directory. The
+    # live path stops resolving in one atomic step, so a concurrent connect()
+    # either sees the whole board or no board — it never opens a half-removed
+    # directory. Sidecars travel with the directory; nothing unlinks
+    # ``kanban.db``/``-wal``/``-shm`` in place.
+    trash_root = _kb.boards_root() / "_trash"
+    trash_root.mkdir(parents=True, exist_ok=True)
+    trash = trash_root / f"{normed}-{int(time.time())}-{os.getpid()}"
+    suffix = 1
+    while trash.exists():
+        trash = trash_root / f"{normed}-{int(time.time())}-{os.getpid()}-{suffix}"
+        suffix += 1
+    d.rename(trash)
+    _forget_live_board(normed, d)
+    shutil.rmtree(trash)
     return {"slug": normed, "action": "deleted", "new_path": ""}
 
 

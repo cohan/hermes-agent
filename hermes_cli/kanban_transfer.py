@@ -33,6 +33,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_quiesce as kq
 from hermes_cli.archive_safe import (
     archive_root_dirs,
     copy_regular_files,
@@ -311,6 +312,18 @@ def import_board(
         if not staged_db.is_file():
             raise ValueError("archive is missing kanban.db")
 
+        # A snapshot taken while a card was mid-run carries a ``running`` row
+        # with a claim_lock and an open run. Importing it would resurrect that
+        # claim on this machine (and the scrub would record the live run as
+        # ``released``), so refuse and name the cards instead — re-export from a
+        # quiesced board.
+        kq.assert_path_quiesced(
+            staged_db,
+            board_label=f"archive {archive.name!r}",
+            command=f"hermes kanban boards export <board> -o {archive.name}",
+            action="import",
+        )
+
         requested = kb._normalize_board_slug(slug or manifest.get("board") or archive_root)
         if not requested:
             raise ValueError(
@@ -322,8 +335,29 @@ def import_board(
         staged_meta = _read_board_metadata(extracted / "board.json")
 
         board_root = kb.board_dir(target)
+        # ``shutil.move`` onto an existing ``kanban.db`` replaces that file.
+        # ``_available_slug`` keys off ``board.json``, so a leftover DB-only
+        # stub would be silently overwritten — never acceptable once the stub
+        # holds rows, and never acceptable under a live holder.
+        dest_db = board_root / "kanban.db"
+        if dest_db.exists() and dest_db.stat().st_size:
+            raise ValueError(
+                f"refusing to import into board {target!r}: {dest_db} already "
+                f"holds a database but no board.json. Inspect it, then remove "
+                f"that directory or import with --as a different slug."
+            )
+        if dest_db.exists():
+            holders = kq.live_holders(dest_db)
+            if holders is None or holders:
+                raise ValueError(
+                    f"refusing to import into board {target!r}: {dest_db.name} "
+                    f"is held open by PID(s) "
+                    f"{', '.join(str(pid) for pid in sorted(holders or [])) or 'unknown'}"
+                    f" — replacing the file under a live holder is the #90950 "
+                    f"split-brain class."
+                )
         board_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))
+        shutil.move(str(staged_db), str(dest_db))
         for tree in ("attachments", "logs"):
             src = extracted / tree
             if src.is_dir():
