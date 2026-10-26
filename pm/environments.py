@@ -17,8 +17,34 @@ from pathlib import Path
 from hermes_constants import get_default_hermes_root, project_venv_dir
 
 
+def _dependency_checkout_root(project_root: Path) -> Path:
+    """The primary checkout for a linked Git worktree, else *project_root* itself.
+
+    Dependency generations belong to an install, not to each linked checkout of
+    that install. Git records a linked worktree's common directory in its
+    ``.git`` file as ``gitdir: <primary>/.git/worktrees/<name>``. Only accept
+    that exact layout: ordinary repositories keep their own resolved root, and
+    malformed or inaccessible Git metadata never changes dependency selection.
+    """
+    root = Path(project_root).resolve()
+    dot_git = root / ".git"
+    if not dot_git.is_file():
+        return root
+    try:
+        prefix, value = dot_git.read_text(encoding="utf-8-sig").strip().split(":", 1)
+        gitdir = Path(value.strip())
+        if not gitdir.is_absolute():
+            gitdir = dot_git.parent / gitdir
+    except (OSError, ValueError):
+        return root
+    if (prefix.strip().lower() != "gitdir" or gitdir.parent.name != "worktrees"
+            or gitdir.parent.parent.name != ".git"):
+        return root
+    return gitdir.parent.parent.parent
+
+
 def install_key(project_root: Path) -> str:
-    canonical = str(Path(project_root).resolve())
+    canonical = str(_dependency_checkout_root(project_root))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
