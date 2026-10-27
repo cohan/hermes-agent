@@ -37,6 +37,47 @@ _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
 
 
+def _dispatcher_cap_note(settings: Any, results: Optional[list]) -> str:
+    """Describe normal concurrency holds so they are not reported as health failures."""
+    notes: list[str] = []
+    max_running = [
+        getattr(result, "max_in_progress_reached", None)
+        for _slug, result in (results or [])
+        if result is not None
+    ]
+    reached = next((count for count in max_running if count is not None), None)
+    if reached is not None and settings.max_in_progress is not None:
+        notes.append(
+            f"max_in_progress={settings.max_in_progress} reached ({reached} running)"
+        )
+    profiles = {
+        (assignee, current)
+        for _slug, result in (results or [])
+        if result is not None
+        for _task_id, assignee, current in getattr(result, "skipped_per_profile_capped", [])
+    }
+    if profiles and settings.max_in_progress_per_profile is not None:
+        profile_text = ", ".join(
+            f"{assignee} ({current} running)" for assignee, current in sorted(profiles)
+        )
+        notes.append(
+            "max_in_progress_per_profile="
+            f"{settings.max_in_progress_per_profile} reached ({profile_text})"
+        )
+    return f" Cap limits: {'; '.join(notes)}." if notes else ""
+
+
+def _dispatcher_stuck_warning(bad_ticks: int, held: str, cap_note: str) -> str:
+    """Render the health warning, retaining the old text when no cap is held."""
+    held_note = f" Last tick held back: {held}." if held else ""
+    return (
+        "kanban dispatcher stuck: ready queue non-empty for "
+        f"{bad_ticks} consecutive ticks but 0 workers spawned."
+        f"{held_note}{cap_note} Check profile health (venv, PATH, credentials) and "
+        "`hermes kanban list --status ready`."
+    )
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -313,11 +354,9 @@ class GatewayKanbanWatchersMixin:
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
                     logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned.%s Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks, f" Last tick held back: {held}." if held else "",
+                        _dispatcher_stuck_warning(
+                            bad_ticks, held, _dispatcher_cap_note(settings, results)
+                        )
                     )
                     last_warn_at = now
             except asyncio.CancelledError:
