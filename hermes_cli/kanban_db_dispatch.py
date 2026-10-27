@@ -130,9 +130,7 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
-    max_in_progress_reached: Optional[int] = None
-    """Total running tasks when the host-wide ``max_in_progress`` stopped
-    this tick before any lane-level skip bucket could be populated."""
+    max_in_progress_reached: Optional[int] = None  # Host-wide cap reached this tick.
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2948,8 +2946,6 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     if _kb._IS_WINDOWS:
         _live_worker_procs[proc.pid] = proc
     return proc.pid
-
-
 # ---------------------------------------------------------------------------
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
