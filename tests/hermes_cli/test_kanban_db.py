@@ -469,6 +469,46 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_ignores_stale_auth_stamp_after_review_handoff(kanban_home):
+    """A successful review handoff supersedes a failure stamp from an older run."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review handoff", assignee="a")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("429 rate limit from an older run", tid),
+        )
+        conn.commit()
+
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+
+def test_reopen_review_clears_stale_failure_stamp(kanban_home):
+    """Reopening a review card remains a supported recovery path."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="reopen review", assignee="a")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("429 rate limit from an older run", tid),
+        )
+        conn.commit()
+        assert kb.reopen_review_task(conn, tid)
+        assert conn.execute(
+            "SELECT last_failure_error FROM tasks WHERE id=?", (tid,),
+        ).fetchone()["last_failure_error"] is None
+
+
 @pytest.mark.parametrize(
     "error_text, expected",
     [
