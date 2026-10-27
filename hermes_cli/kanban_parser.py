@@ -158,7 +158,11 @@ _BOARD_SPECS = [
         "event naming the source board, the snapshot and the task's original created_at. Columns "
         "that only describe the source machine (claims, PIDs, session ids, workspace paths) are "
         "dropped, and tasks whose workspace cannot be rebuilt here are parked in triage. "
-        "Idempotent: a task id already on this board is left untouched, so a re-run adds nothing."
+        "Idempotent: a task id already on this board is left untouched, so a re-run adds nothing. "
+        "Refuses (exit 1) while any card on either board is running, holds a claim_lock or has an "
+        "unfinished run, naming the blocking cards: a merge rewrites the board file, so it runs "
+        "only quiesced. The merged rows are written to a checkpointed copy which is published by "
+        "atomic rename once the live board is proven to have no open holder."
     )),
 ]
 
