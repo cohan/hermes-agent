@@ -1620,7 +1620,12 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    # ``last_failure_error`` is retained across handoffs.  A successful
+    # review/completion therefore supersedes an older quota/auth stamp; only
+    # the failure that most recently ended the card may trip this guard.
+    success_outcomes = {"review_requested", "completed"}
+    if (err and latest_outcome not in {"crashed", *success_outcomes}
+            and _RESPAWN_BLOCKER_RE.search(err)):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
