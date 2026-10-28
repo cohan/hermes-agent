@@ -553,10 +553,27 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] Route %s HMAC secret is missing, blank, or not a string; refusing request",
                          route_name)
             return None, _json_error("Webhook route is missing an HMAC secret", 403)
-        if secret != _INSECURE_NO_AUTH and not self._validate_signature(request, raw_body, secret):
+        mention_route = isinstance(route_config.get("gitlab_mentions"), dict)
+        if mention_route and (secret == _INSECURE_NO_AUTH
+                              or not self._validate_replay_protected_signature(request, raw_body, secret)):
+            logger.warning("[webhook] Invalid or replayable signature for GitLab mention route %s", route_name)
+            return None, _json_error("GitLab mention route requires a replay-protected signature", 401)
+        if not mention_route and secret != _INSECURE_NO_AUTH and not self._validate_signature(request, raw_body, secret):
             logger.warning("[webhook] Invalid signature for route %s", route_name)
             return None, _json_error("Invalid signature", 401)
         return raw_body, None
+
+    def _validate_replay_protected_signature(self, request: web.Request, body: bytes, secret: str) -> bool:
+        """Accept only timestamp-bound Standard Webhooks/Svix or generic V2 signatures."""
+        headers = request.headers
+        standard = tuple(headers.get(name, "") for name in
+                        ("webhook-id", "webhook-timestamp", "webhook-signature"))
+        svix = tuple(headers.get(name, "") for name in ("svix-id", "svix-timestamp", "svix-signature"))
+        if all(standard) or all(svix):
+            return self._validate_signature(request, body, secret)
+        if headers.get("X-Webhook-Signature-V2") and headers.get("X-Webhook-Timestamp"):
+            return self._validate_signature(request, body, secret)
+        return False
 
     @staticmethod
     def _parse_body(raw_body: bytes) -> Any:
@@ -697,6 +714,7 @@ class WebhookAdapter(BasePlatformAdapter):
                       or payload.get("event_type", "") or payload.get("type", "") or "unknown")
         mention_settings = route_config.get("gitlab_mentions")
         mention_context = None
+        mention_prompt = None
         if isinstance(mention_settings, dict):
             if not headers.get("X-GitLab-Event") and event_type not in {
                     "Issue Hook", "Merge Request Hook", "Note Hook"}:
@@ -708,7 +726,7 @@ class WebhookAdapter(BasePlatformAdapter):
             profile = mention_context["profile"]
             if not self._mention_profile_is_served(profile):
                 return _json_error("Mention target profile is not served", 404)
-            prompt = render_gitlab_mention_prompt(mention_context, route_config.get("prompt", ""))
+            mention_prompt = render_gitlab_mention_prompt(mention_context, route_config.get("prompt", ""))
             if request.query.get("dry_run") == "1" or mention_settings.get("dry_run") is True:
                 return web.json_response({"status": "dry_run", "context": mention_context}, status=200)  # type: ignore[union-attr]
         allowed_events = route_config.get("events", [])
@@ -733,8 +751,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload or payload
-            prompt = (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
-                      or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name))
+            prompt = (mention_prompt if mention_prompt is not None else
+                      (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
+                       or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name)))
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
             if (skills := route_config.get("skills", [])) and not route_config.get("cron_job"):
                 prompt = self._apply_skills(prompt, skills)

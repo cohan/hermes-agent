@@ -24,11 +24,11 @@ platforms:
           prompt: "Use the normal Hermes approval and permission boundaries."
 ```
 
-GitLab should be configured with a signing token. Hermes validates the Standard Webhooks
+GitLab should be configured with a replay-protected signing token. Hermes validates the Standard Webhooks
 `webhook-id`, `webhook-timestamp`, and `webhook-signature` headers, rejects stale timestamps,
-and deduplicates the delivery id. The legacy `X-Gitlab-Token` path remains supported by the
-underlying generic adapter but does not provide replay protection; use signing tokens for this
-route.
+and deduplicates the delivery id. Mention routes also accept timestamp-bound generic V2 headers
+(`X-Webhook-Timestamp` plus `X-Webhook-Signature-V2`) and reject legacy `X-Gitlab-Token`,
+body-only `X-Webhook-Signature`, and `INSECURE_NO_AUTH` because those modes are replayable.
 
 ## Supported event matrix
 
