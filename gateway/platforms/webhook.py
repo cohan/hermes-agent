@@ -43,6 +43,7 @@ from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coales
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.platforms.webhook_mcp_events import (
     handle_mcp_event_control, mcp_event_delivery_id, render_mcp_event_prompt)
+from gateway.platforms.gitlab_mentions import extract_gitlab_mention, render_gitlab_mention_prompt
 from gateway.response_filters import is_autonomous_silence_response
 
 logger = logging.getLogger(__name__)
@@ -513,6 +514,10 @@ class WebhookAdapter(BasePlatformAdapter):
     @staticmethod
     def _route_allows_profile(route_config: dict, request_profile: Optional[str]) -> bool:
         """Omitting ``profile`` binds a route to default; an explicit null/blank/non-string fails closed."""
+        # GitLab mention routes select the destination profile from an explicit allow-list after
+        # authenticating and parsing the event. A URL profile still wins and is checked normally.
+        if "profile" not in route_config and isinstance(route_config.get("gitlab_mentions"), dict):
+            return request_profile is None
         configured = route_config.get("profile") if "profile" in route_config else "default"
         if not isinstance(configured, str) or not configured.strip():
             return False
@@ -667,6 +672,7 @@ class WebhookAdapter(BasePlatformAdapter):
             raw_body, error_response = await self._read_authenticated_body(request, route_name, route_config)
         if error_response is not None:
             return error_response
+        assert route_config is not None
         headers = request.headers
         delivery_id = _header_delivery_id(headers)
         # A parked profile is retried, before any delivery id is recorded. The check resolves
@@ -689,6 +695,22 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery_id = mcp_event_delivery_id(route_config, payload) or delivery_id
         event_type = (headers.get("X-GitHub-Event", "") or headers.get("X-GitLab-Event", "")
                       or payload.get("event_type", "") or payload.get("type", "") or "unknown")
+        mention_settings = route_config.get("gitlab_mentions")
+        mention_context = None
+        if isinstance(mention_settings, dict):
+            if not headers.get("X-GitLab-Event") and event_type not in {
+                    "Issue Hook", "Merge Request Hook", "Note Hook"}:
+                return web.json_response({"status": "ignored", "reason": "unsupported_gitlab_event"})  # type: ignore[union-attr]
+            mapping = mention_settings.get("profiles", {})
+            mention_context = extract_gitlab_mention(payload, event_type, mapping)
+            if mention_context is None:
+                return web.json_response({"status": "ignored", "reason": "no_allowed_mention"})  # type: ignore[union-attr]
+            profile = mention_context["profile"]
+            if not self._mention_profile_is_served(profile):
+                return _json_error("Mention target profile is not served", 404)
+            prompt = render_gitlab_mention_prompt(mention_context, route_config.get("prompt", ""))
+            if request.query.get("dry_run") == "1" or mention_settings.get("dry_run") is True:
+                return web.json_response({"status": "dry_run", "context": mention_context}, status=200)  # type: ignore[union-attr]
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug("[webhook] Ignoring event %s for route %s (allowed: %s)", event_type, route_name,
@@ -739,6 +761,19 @@ class WebhookAdapter(BasePlatformAdapter):
                                       "delivery_id": delivery_id}, status=202)
         return await self._dispatch_agent_run(request, route_config, route_name, profile, payload, prompt, event_type,
                                         delivery_id, now)
+
+    def _mention_profile_is_served(self, profile: str) -> bool:
+        """Fail closed unless the target is one of the profiles served by this gateway."""
+        if not isinstance(profile, str) or not profile.strip():
+            return False
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+            served = {name for name, _ in profiles_to_serve(
+                multiplex=bool(getattr(getattr(self.gateway_runner, "config", None), "multiplex_profiles", False)))}
+            return profile in served
+        except Exception:
+            logger.warning("[webhook] GitLab mention target profile is unavailable")
+            return False
 
     async def _dispatch_agent_run(self, request, route_config: dict, route_name: str, profile, payload: Any, prompt: str,
                             event_type: str, delivery_id: str, now: float) -> web.Response:
