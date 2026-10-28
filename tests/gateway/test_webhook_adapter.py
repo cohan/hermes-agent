@@ -326,6 +326,13 @@ class TestValidateSignature:
         legacy = _mock_request(headers={"X-Gitlab-Token": secret})
         assert adapter._validate_replay_protected_signature(legacy, body, secret) is False
 
+        mixed = _mock_request(headers={
+            "X-Gitlab-Token": secret,
+            "X-Webhook-Timestamp": now,
+            "X-Webhook-Signature-V2": _generic_v2_signature(body, secret, now),
+        })
+        assert adapter._validate_replay_protected_signature(mixed, body, secret) is False
+
     @pytest.mark.asyncio
     async def test_gitlab_mention_route_rejects_legacy_token(self):
         adapter = _make_adapter()

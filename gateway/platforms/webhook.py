@@ -566,6 +566,14 @@ class WebhookAdapter(BasePlatformAdapter):
     def _validate_replay_protected_signature(self, request: web.Request, body: bytes, secret: str) -> bool:
         """Accept only timestamp-bound Standard Webhooks/Svix or generic V2 signatures."""
         headers = request.headers
+        # GitLab mention routes must never accept a replayable legacy credential,
+        # even when an attacker also supplies timestamp/signature headers.  The
+        # generic validator checks legacy headers first for compatibility with
+        # existing non-mention routes, so reject the mixed form here before
+        # delegating to it.
+        if any(headers.get(name, "") for name in (
+                "X-Gitlab-Token", "X-Webhook-Signature", "linear-signature", "X-Hub-Signature-256")):
+            return False
         standard = tuple(headers.get(name, "") for name in
                         ("webhook-id", "webhook-timestamp", "webhook-signature"))
         svix = tuple(headers.get(name, "") for name in ("svix-id", "svix-timestamp", "svix-signature"))
