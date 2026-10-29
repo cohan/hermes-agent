@@ -517,7 +517,11 @@ class _KanbanNotification:
         # The wake self-post path needs the key even when every event was skipped.
         self.sub_key = (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
         mode = sub.get("delivery_mode") or "notify"
-        self.wake_agent = mode in ("notify+wake", "wake")
+        # The requested wake is remembered separately so a refused tablet notice can
+        # restore it: suppressing Telegram for a wiki card is only safe while the
+        # tablet actually accepts the notice.
+        self.wake_requested = mode in ("notify+wake", "wake")
+        self.wake_agent = self.wake_requested
         self.send_passive = mode != "wake"
         self.wiki_to_tablet = False
         try:
@@ -729,20 +733,26 @@ class _KanbanNotification:
             if msg is None:
                 continue
             if self.wiki_to_tablet:
+                accepted = False
                 try:
                     from gateway.kanban_wiki_notice import post_wiki_notice
-                    if not post_wiki_notice(self.title[:60], msg):
-                        logger.warning("kanban notifier: tablet wiki notice was not accepted for %s", self.task_id)
+                    accepted = bool(post_wiki_notice(self.title[:60], msg))
                 except Exception as exc:
-                    # The tablet route is best effort: consume the event even when its
-                    # optional module or receiver cannot accept the notice.
                     logger.warning("kanban notifier: tablet wiki notice failed for %s: %s", self.task_id, exc)
-                await _to_thread_process_service(partial(
-                    self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
-                    event_id=ev.id,
-                ))
-                self.clear_failures()
-                continue
+                if accepted:
+                    await _to_thread_process_service(partial(
+                        self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
+                        event_id=ev.id,
+                    ))
+                    self.clear_failures()
+                    continue
+                # The panel refused the notice. Telegram was suppressed on the strength
+                # of this route, so restore it rather than delivering the event nowhere.
+                self.wiki_to_tablet = False
+                self.wake_agent = self.wake_requested
+                logger.warning(
+                    "kanban notifier: tablet refused wiki notice for %s; falling back to telegram", self.task_id,
+                )
             # Non-push adapters (api_server) always report SendResult(success=False)
             # from send(); treating that as failure would drop the sub forever and
             # make the wake path unreachable. Skip the doomed send; the self-post

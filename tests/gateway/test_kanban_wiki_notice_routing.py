@@ -1,5 +1,5 @@
 import asyncio
-from urllib.parse import parse_qs, urlparse
+import json
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
@@ -19,6 +19,20 @@ class RecordingAdapter:
     async def handle_message(self, event):
         self.handled.append(event)
         event._gateway_accepted = True
+
+
+class _Response:
+    def __init__(self, body=b'{"ok": true}'):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
@@ -74,30 +88,67 @@ def _cursor(task_id):
         conn.close()
 
 
-def test_wiki_update_completed_routes_to_tablet_and_advances_cursor(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wiki-routing.db"))
-    kb.init_db()
+def _capture_requests(monkeypatch, *, body=b'{"ok": true}'):
+    """Point ``urlopen`` at a stub that records the wire shape of each request."""
+    import gateway.kanban_wiki_notice as wiki_notice
+
     notices = []
-
-    class Response:
-        def read(self):
-            return b'{"ok": true}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
 
     def post_to_stub(request, timeout):
         notices.append({
             "method": request.get_method(),
-            "payload": parse_qs(urlparse(request.full_url).query),
+            "content_type": request.get_header("Content-type"),
+            "body": request.data,
+            "payload": json.loads(request.data.decode("utf-8")),
+            "url": request.full_url,
             "timeout": timeout,
         })
-        return Response()
+        return _Response(body)
 
-    monkeypatch.setattr("gateway.kanban_wiki_notice.urlopen", post_to_stub)
+    monkeypatch.setattr(wiki_notice, "urlopen", post_to_stub)
+    return notices
+
+
+# --- wire shape: the receiver parses a JSON body, not the query string ---------
+
+
+def test_post_wiki_notice_sends_json_body_to_the_endpoint(monkeypatch):
+    from gateway.kanban_wiki_notice import post_wiki_notice
+
+    notices = _capture_requests(monkeypatch)
+
+    assert post_wiki_notice("Wiki update: shape", "card body text", url="http://panel.test/alert") is True
+
+    assert len(notices) == 1
+    sent = notices[0]
+    assert sent["method"] == "POST"
+    assert sent["url"] == "http://panel.test/alert"
+    assert sent["content_type"] == "application/json"
+    assert sent["body"], "POST must carry a body: the receiver ignores the query string"
+    assert sent["payload"] == {
+        "kind": "step",
+        "severity": "Information",
+        "level": "low",
+        "title": "Wiki update: shape",
+        "text": "card body text",
+    }
+
+
+def test_post_wiki_notice_returns_false_when_receiver_refuses(monkeypatch):
+    from gateway.kanban_wiki_notice import post_wiki_notice
+
+    _capture_requests(monkeypatch, body=b'{"ok": false, "error": "rejected"}')
+
+    assert post_wiki_notice("Wiki update: refused", "text") is False
+
+
+# --- notifier routing ---------------------------------------------------------
+
+
+def test_wiki_update_completed_routes_to_tablet_and_advances_cursor(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wiki-routing.db"))
+    kb.init_db()
+    notices = _capture_requests(monkeypatch)
     task_id, event_id = _completed_subscription("Wiki update: kanban-routing")
 
     adapter = RecordingAdapter()
@@ -107,14 +158,51 @@ def test_wiki_update_completed_routes_to_tablet_and_advances_cursor(tmp_path, mo
     assert adapter.handled == []
     assert len(notices) == 1
     assert notices[0]["method"] == "POST"
-    assert notices[0]["payload"]["kind"] == ["step"]
-    assert notices[0]["payload"]["severity"] == ["Information"]
-    assert notices[0]["payload"]["title"] == ["Wiki update: kanban-routing"]
-    assert "done" in notices[0]["payload"]["text"][0].lower()
+    assert notices[0]["content_type"] == "application/json"
+    payload = notices[0]["payload"]
+    assert payload["kind"] == "step"
+    assert payload["severity"] == "Information"
+    assert payload["level"] == "low"
+    assert payload["title"] == "Wiki update: kanban-routing"
+    assert "done" in payload["text"].lower()
     assert _cursor(task_id) == event_id
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
     assert len(notices) == 1
+
+
+def test_refused_tablet_notice_falls_back_to_telegram(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wiki-fallback.db"))
+    kb.init_db()
+    # A receiver that refuses (ok=false, or an error status turned into an exception by
+    # urlopen) must not consume the event: Telegram was suppressed for this card.
+    notices = _capture_requests(monkeypatch, body=b'{"ok": false, "error": "rejected"}')
+    task_id, event_id = _completed_subscription("Wiki update: fallback")
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(notices) == 1
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert _cursor(task_id) == event_id
+
+
+def test_raising_tablet_notice_falls_back_to_telegram(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wiki-fallback-raise.db"))
+    kb.init_db()
+
+    def boom(title, text):
+        raise OSError("panel unreachable")
+
+    monkeypatch.setattr("gateway.kanban_wiki_notice.post_wiki_notice", boom)
+    _completed_subscription("Wiki update: fallback-raise")
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
 
 
 def test_disabled_wiki_tablet_routing_uses_telegram(tmp_path, monkeypatch):

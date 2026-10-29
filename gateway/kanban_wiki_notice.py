@@ -3,7 +3,6 @@
 import json
 import logging
 import os
-from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
@@ -23,7 +22,13 @@ def tablet_enabled() -> bool:
 
 
 def post_wiki_notice(title, text, *, url=None, timeout=5.0) -> bool:
-    """Post a silent Information notice, returning False when the panel is unavailable."""
+    """Post a silent Information notice, returning False when the panel is unavailable.
+
+    The receiver (panel-alert / alertd.py on copc) parses a JSON body on POST and
+    ignores the query string: a body-less POST is read as ``{}`` and rejected with
+    HTTP 400, so the payload must be sent as JSON with a Content-Type of
+    ``application/json``.
+    """
     endpoint = url or os.environ.get("HERMES_PANEL_ALERT_URL", _DEFAULT_ALERT_URL)
     payload = {
         "kind": "step",
@@ -34,8 +39,9 @@ def post_wiki_notice(title, text, *, url=None, timeout=5.0) -> bool:
     }
     try:
         request = Request(
-            f"{endpoint}?{urlencode(payload)}",
-            data=b"",
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urlopen(request, timeout=timeout) as response:
