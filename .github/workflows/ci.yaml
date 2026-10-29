@@ -51,10 +51,16 @@ permissions:
 # commit or a rerun of the same branch — the caller's own concurrency uses
 # github.run_id, so even a parent rerun cannot kill this child mid-flight.
 # Release (workflow_call with inputs.release) never cancels and never gets
-# cancelled: its group is github.run_id. PRs collapse per-PR; pushes use the
-# ref as before.
+# cancelled: its group is github.run_id. PRs collapse per revision (PR number +
+# head SHA); pushes use the ref as before.
+#
+# The head SHA used to be missing from the PR group, so the group was the PR
+# number alone. A run GitHub never finished cancelling — its job was waiting for
+# a runner label this fork does not register — stayed in the group forever, and
+# every later push to that PR sat ``pending`` with zero jobs. Keying the group
+# on the revision confines a wedged run to its own commit.
 concurrency:
-  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || github.ref) }}
+  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && format('{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || github.ref) }}
   cancel-in-progress: ${{ inputs.release != true && github.event_name == 'pull_request' }}
 
 jobs:
