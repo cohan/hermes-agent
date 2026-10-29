@@ -204,6 +204,11 @@ jobs:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
           HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '4' || '4') || '' }}
+          # The 300s per-file cap is scaled by test_durations.json, which a fresh GitHub-hosted
+          # runner does not have (it only accumulates on one long-lived checkout). The desktop
+          # hand-off file spawns 12 real windows.ps1 hand-offs and needs >300s there, so give the
+          # windows lane explicit headroom. The bound still kills a genuinely hung file.
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.marker == 'windows' && '900' || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
