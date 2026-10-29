@@ -551,6 +551,27 @@ def _close_leaked_session_dbs():
 
 
 @pytest.fixture(autouse=True)
+def _neutralize_tablet_alert_receiver(monkeypatch):
+    """No test may POST a kanban lifecycle notice to the real tablet receiver.
+
+    The notifier routes routine transitions to ``10.0.0.113:8791`` (panel-alert on
+    copc); on a dev box that answers, a test would put real notices on the
+    household tablet. Refusing here exercises the notifier's Telegram fallback and
+    keeps the humaniser (an auxiliary LLM call) out of unit tests entirely.
+    """
+    try:
+        import gateway.kanban_tablet_notice as _tablet_notice
+    except Exception:
+        return
+
+    def _refuse(*_args, **_kwargs):
+        raise OSError("tablet alert receiver is disabled in tests")
+
+    monkeypatch.setattr(_tablet_notice, "urlopen", _refuse, raising=False)
+    monkeypatch.setattr(_tablet_notice, "humanise", lambda text, **_kwargs: "", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_webbrowser(monkeypatch):
     """Record browser-open attempts instead of opening real browser windows."""
     import webbrowser as _webbrowser

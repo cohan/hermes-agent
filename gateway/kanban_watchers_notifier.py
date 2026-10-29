@@ -44,7 +44,9 @@ def _pin_first():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+# ``spawned`` is the "running" transition: the claim lock alone is not news,
+# the worker process actually starting is.
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "spawned", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -73,7 +75,43 @@ def diagnostic_event(ev) -> bool:
 # every 5 seconds forever. A genuinely dead chat still drops, just ~60s later — a fine trade for an
 # unattended gate where a false drop means silent work pileup.
 MAX_SEND_FAILURES = 12
-_WIKI_TABLET_ROUTE_LOGGED = False
+_TABLET_ROUTE_LOGGED = False
+
+# --- Lifecycle routing -------------------------------------------------------
+# Cohan's rule (2026-10-29): the tablet carries the whole card lifecycle, the
+# phone carries only what needs him wherever he is. Every transition is one
+# notice — no coalescing, no dedupe by card — and a card never gets both a
+# tablet POST and a Telegram ping for the same transition.
+_TELEGRAM_KINDS = frozenset({"blocked", "block_loop_detected", "gave_up", "crashed", "timed_out"})
+_TELEGRAM_STATUSES = frozenset({"blocked", "triage"})
+
+# Event ids already POSTed to the tablet in this process, keyed per board so two
+# boards cannot shadow each other's ids. Two subscriptions on one card would
+# otherwise each post the same event; a refused POST is never marked, so the
+# next tick retries it.
+_TABLET_SENT: dict[tuple, None] = {}
+_TABLET_SENT_MAX = 2000
+
+
+def telegram_required(ev) -> bool:
+    """True when this event needs Cohan's phone: needs-you blocks and triage."""
+    if ev.kind in _TELEGRAM_KINDS:
+        return True
+    if ev.kind == "status":
+        return str((getattr(ev, "payload", None) or {}).get("status") or "").strip().lower() in _TELEGRAM_STATUSES
+    return False
+
+
+def _tablet_already_sent(board_slug, event_id) -> bool:
+    return (board_slug, event_id) in _TABLET_SENT
+
+
+def _mark_tablet_sent(board_slug, event_id) -> None:
+    key = (board_slug, event_id)
+    _TABLET_SENT[key] = None
+    if len(_TABLET_SENT) > _TABLET_SENT_MAX:
+        for stale in list(_TABLET_SENT)[: _TABLET_SENT_MAX // 2]:
+            _TABLET_SENT.pop(stale, None)
 
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
@@ -480,6 +518,8 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
     "crashed": lambda ev, n: (t("gateway.kanban.ping.crashed", head=n.head), None, None),
     "timed_out": _fmt_timed_out,
     "status": lambda ev, n: (t("gateway.kanban.ping.status", head=n.head, status=_payload(ev, "status") or ""), None, None),
+    # A worker process just started: the card is Running.
+    "spawned": lambda ev, n: (t("gateway.kanban.ping.status", head=n.head, status="running"), None, None),
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
@@ -498,7 +538,7 @@ class _KanbanNotification:
     """
 
     def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict) -> None:
-        global _WIKI_TABLET_ROUTE_LOGGED
+        global _TABLET_ROUTE_LOGGED
         self.runner = runner
         self.d = d
         self.platform_cls = platform_cls
@@ -517,24 +557,21 @@ class _KanbanNotification:
         # The wake self-post path needs the key even when every event was skipped.
         self.sub_key = (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
         mode = sub.get("delivery_mode") or "notify"
-        # The requested wake is remembered separately so a refused tablet notice can
-        # restore it: suppressing Telegram for a wiki card is only safe while the
-        # tablet actually accepts the notice.
         self.wake_requested = mode in ("notify+wake", "wake")
         self.wake_agent = self.wake_requested
         self.send_passive = mode != "wake"
-        self.wiki_to_tablet = False
+        # The tablet stream is decided per EVENT (``telegram_required``), not per
+        # card: this flag is only the kill switch for the whole stream.
+        self.tablet_route = False
         try:
-            from gateway.kanban_wiki_notice import tablet_enabled, wiki_update_task
-            self.wiki_to_tablet = wiki_update_task(task) and tablet_enabled()
+            from gateway.kanban_tablet_notice import tablet_enabled
+            self.tablet_route = tablet_enabled()
         except Exception as exc:
             # This optional route must never stop notifier startup or delivery.
-            logger.warning("kanban notifier: wiki tablet route unavailable: %s", exc)
-        if self.wiki_to_tablet:
-            self.wake_agent = False
-            if not _WIKI_TABLET_ROUTE_LOGGED:
-                logger.info("kanban notifier: wiki-update notices routed to tablet (telegram suppressed)")
-                _WIKI_TABLET_ROUTE_LOGGED = True
+            logger.warning("kanban notifier: tablet notice route unavailable: %s", exc)
+        if self.tablet_route and not _TABLET_ROUTE_LOGGED:
+            logger.info("kanban notifier: card lifecycle notices routed to tablet (telegram for needs-you only)")
+            _TABLET_ROUTE_LOGGED = True
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
@@ -726,32 +763,70 @@ class _KanbanNotification:
                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
         return True
 
+    async def _record_ping(self, ev: Any) -> None:
+        """Durable "this event was delivered" marker for the subscription."""
+        await _to_thread_process_service(partial(
+            self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
+            event_id=ev.id,
+        ))
+
+    async def _humanised_notice(self, ev: Any) -> str:
+        """Expanded plain text, humanised when the cheap model answers in time.
+
+        A humaniser that is slow, rate-limited or broken must never swallow the
+        notice: the plain expanded text goes instead.
+        """
+        from gateway import kanban_tablet_notice as tablet
+        plain = tablet.build_notice_text(self.task, ev)
+        try:
+            prose = await asyncio.wait_for(
+                asyncio.to_thread(tablet.humanise, plain), timeout=tablet.HUMANISE_TIMEOUT + 1.0,
+            )
+        except Exception as exc:
+            logger.info("kanban notifier: humaniser failed for %s (%s); sending plain text", self.task_id, exc)
+            prose = ""
+        return prose or plain
+
+    async def _send_tablet_notice(self, ev: Any, msg: str) -> bool:
+        """One POST per transition; False when the panel refused it.
+
+        The tablet gets its own wording built from the task and event, not the
+        Telegram ``msg`` (headers, emoji, ids — furniture that is unreadable at
+        arm's length). ``msg`` stays in the signature because this is one of the
+        two routes the caller chooses between.
+        """
+        from gateway import kanban_tablet_notice as tablet
+        if _tablet_already_sent(self.board_slug, ev.id):
+            return True
+        text = await self._humanised_notice(ev)
+        colour = tablet.notice_colour(ev)
+        try:
+            accepted = bool(await asyncio.to_thread(
+                tablet.post_notice, self.title[:tablet.TITLE_MAX_CHARS], text, bg=colour,
+            ))
+        except Exception as exc:
+            logger.warning("kanban notifier: tablet notice failed for %s: %s", self.task_id, exc)
+            accepted = False
+        if accepted:
+            _mark_tablet_sent(self.board_slug, ev.id)
+        return accepted
+
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
                 continue
-            if self.wiki_to_tablet:
-                accepted = False
-                try:
-                    from gateway.kanban_wiki_notice import post_wiki_notice
-                    accepted = bool(post_wiki_notice(self.title[:60], msg))
-                except Exception as exc:
-                    logger.warning("kanban notifier: tablet wiki notice failed for %s: %s", self.task_id, exc)
-                if accepted:
-                    await _to_thread_process_service(partial(
-                        self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
-                        event_id=ev.id,
-                    ))
+            # The tablet carries the routine lifecycle; the phone is reserved for
+            # the events that need Cohan wherever he is. A refused tablet POST
+            # falls through to Telegram, so no notice is delivered nowhere.
+            if self.tablet_route and not telegram_required(ev):
+                if await self._send_tablet_notice(ev, msg):
+                    await self._record_ping(ev)
                     self.clear_failures()
                     continue
-                # The panel refused the notice. Telegram was suppressed on the strength
-                # of this route, so restore it rather than delivering the event nowhere.
-                self.wiki_to_tablet = False
-                self.wake_agent = self.wake_requested
                 logger.warning(
-                    "kanban notifier: tablet refused wiki notice for %s; falling back to telegram", self.task_id,
+                    "kanban notifier: tablet refused notice for %s; falling back to telegram", self.task_id,
                 )
             # Non-push adapters (api_server) always report SendResult(success=False)
             # from send(); treating that as failure would drop the sub forever and
@@ -771,10 +846,7 @@ class _KanbanNotification:
             try:
                 if await self._send_event(ev, msg) is False:
                     continue
-                await _to_thread_process_service(partial(
-                    self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
-                    event_id=ev.id,
-                ))
+                await self._record_ping(ev)
                 self.clear_failures()
             except Exception as exc:
                 await self.delivery_failed(
