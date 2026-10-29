@@ -31,6 +31,7 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
     _INSECURE_NO_AUTH,
+    _header_delivery_id,
     _is_usable_secret,
 )
 
@@ -607,6 +608,51 @@ class TestHTTPHandling:
 
 
 class TestIdempotency:
+
+    def test_gitlab_delivery_id_precedence(self):
+        """GitLab retry identifiers are stable and outrank transient request ids."""
+        assert _header_delivery_id({"X-Gitlab-Event-UUID": "event-1", "X-Request-ID": "request-1"}) == "event-1"
+        assert _header_delivery_id({"Idempotency-Key": "retry-1", "X-Gitlab-Event-UUID": "event-1"}) == "retry-1"
+        assert _header_delivery_id({"webhook-id": "webhook-1", "Idempotency-Key": "retry-1"}) == "webhook-1"
+
+    @pytest.mark.asyncio
+    async def test_gitlab_idempotency_key_deduplicates_signed_mention_retry(self):
+        """Identical signed GitLab mention retries are delivered once."""
+        secret = "mention-secret"
+        routes = {
+            "gitlab": {
+                "secret": secret,
+                "gitlab_mentions": {"profiles": {"builder": "default"}},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter._mention_profile_is_served = lambda profile: True
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "object_kind": "note",
+            "object_attributes": {"note": "Please inspect @builder", "id": 91},
+            "project": {"id": 12, "path_with_namespace": "group/project",
+                        "web_url": "https://gitlab.test/group/project"},
+            "user": {"id": 44, "username": "cohan"},
+        }
+        body = json.dumps(payload).encode()
+        timestamp = str(int(time.time()))
+        headers = {
+            "X-GitLab-Event": "Note Hook",
+            "X-Webhook-Timestamp": timestamp,
+            "X-Webhook-Signature-V2": _generic_v2_signature(body, secret, timestamp),
+            "Idempotency-Key": "gitlab-retry-123",
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/gitlab", data=body, headers=headers)
+            second = await cli.post("/webhooks/gitlab", data=body, headers=headers)
+
+        assert (first.status, (await first.json())["status"]) == (202, "accepted")
+        assert (second.status, (await second.json())["status"]) == (200, "duplicate")
+        assert adapter.handle_message.await_count == 1
 
     @pytest.mark.asyncio
     async def test_duplicate_delivery_id_returns_200(self):

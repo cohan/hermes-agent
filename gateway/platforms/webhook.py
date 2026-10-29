@@ -76,9 +76,26 @@ _GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 
 
 def _header_delivery_id(headers) -> str:
-    """The provider's delivery id (GitHub, Svix, Standard Webhooks, generic), else a fresh one."""
-    return headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
-        "webhook-id", headers.get("X-Request-ID", uuid.uuid4().hex))))
+    """Return the most stable provider delivery id available in request headers.
+
+    GitLab retries preserve ``webhook-id`` and ``Idempotency-Key`` (and older
+    installations expose ``X-Gitlab-Event-UUID``), so use those before the
+    generic request id.  A random fallback is intentional for providers that
+    do not supply a retry-stable id.
+    """
+    for name in (
+        # GitLab's retry-stable identifiers take precedence when present.
+        "webhook-id",
+        "Idempotency-Key",
+        "X-Gitlab-Event-UUID",
+        "X-GitHub-Delivery",
+        "svix-id",
+        "X-Request-ID",
+    ):
+        value = headers.get(name)
+        if value:
+            return value
+    return uuid.uuid4().hex
 
 
 @dataclass(frozen=True)
