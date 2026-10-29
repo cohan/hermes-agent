@@ -503,8 +503,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "work. Defaults to false (classic single-shot worker)."
         )),
         "completion_contract": _prop("string", (
-            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
-            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
+            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact PR/MR URL "
+            "(https://github.com/O/R/pull/N or https://git.coio.uk/G/P/-/merge_requests/N). "
+            "PR tasks cannot complete until repository-required exact-head CI passes; a GitLab merge request "
+            "additionally needs the kanban-accepted label applied by a non-author. On publication pass metadata.published_pr."
         )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "

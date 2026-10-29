@@ -204,7 +204,8 @@ _SPECS = [
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
         _arg("--completion-contract", metavar="CONTRACT",
-             help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+             help="local-only (default), OWNER/REPO for publication, or an exact GitHub PR / git.coio.uk merge-request URL; "
+                  "required exact-head CI (plus the kanban-accepted label on GitLab) gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
