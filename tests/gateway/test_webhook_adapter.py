@@ -31,6 +31,7 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
     _INSECURE_NO_AUTH,
+    _header_delivery_id,
     _is_usable_secret,
 )
 
@@ -305,6 +306,45 @@ class TestValidateSignature:
                                              "webhook-signature": "v1,AAAA"})
         assert adapter._validate_signature(req_partial, b"{}", "legacy-token") is False
 
+    def test_gitlab_mention_requires_replay_protected_auth(self):
+        adapter = _make_adapter()
+        body = b'{"object_kind":"note"}'
+        secret = "mention-secret"
+        now = str(int(time.time()))
+        valid = _mock_request(headers={
+            "X-Webhook-Timestamp": now,
+            "X-Webhook-Signature-V2": _generic_v2_signature(body, secret, now),
+        })
+        assert adapter._validate_replay_protected_signature(valid, body, secret) is True
+
+        stale = str(int(time.time()) - 600)
+        stale_request = _mock_request(headers={
+            "X-Webhook-Timestamp": stale,
+            "X-Webhook-Signature-V2": _generic_v2_signature(body, secret, stale),
+        })
+        assert adapter._validate_replay_protected_signature(stale_request, body, secret) is False
+
+        legacy = _mock_request(headers={"X-Gitlab-Token": secret})
+        assert adapter._validate_replay_protected_signature(legacy, body, secret) is False
+
+        mixed = _mock_request(headers={
+            "X-Gitlab-Token": secret,
+            "X-Webhook-Timestamp": now,
+            "X-Webhook-Signature-V2": _generic_v2_signature(body, secret, now),
+        })
+        assert adapter._validate_replay_protected_signature(mixed, body, secret) is False
+
+    @pytest.mark.asyncio
+    async def test_gitlab_mention_route_rejects_legacy_token(self):
+        adapter = _make_adapter()
+        request = _mock_request(headers={"X-Gitlab-Token": "mention-secret"}, body=b"{}")
+        raw_body, response = await adapter._read_authenticated_body(
+            request, "gitlab", {"secret": "mention-secret", "gitlab_mentions": {}}
+        )
+        assert raw_body is None
+        assert response is not None
+        assert response.status == 401
+
 
 # ===================================================================
 # Prompt rendering
@@ -374,6 +414,129 @@ class TestEventFilter:
                 headers={"X-GitHub-Event": "pull_request"},
             )
             assert resp.status == 202
+
+    @pytest.mark.asyncio
+    async def test_gitlab_mention_dispatch_preserves_context(self):
+        secret = "mention-secret"
+        routes = {
+            "gitlab": {
+                "secret": secret,
+                "gitlab_mentions": {"profiles": {"builder": "default"}},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter._mention_profile_is_served = lambda profile: True
+        captured = []
+
+        async def observe(event):
+            captured.append(event.text)
+
+        adapter.handle_message = observe
+        app = _create_app(adapter)
+        payload = {
+            "object_kind": "note",
+            "object_attributes": {"note": "Please inspect @builder", "id": 91, "iid": 7,
+                                   "url": "https://gitlab.test/group/project/-/issues/7"},
+            "project": {"id": 12, "path_with_namespace": "group/project",
+                        "web_url": "https://gitlab.test/group/project"},
+            "user": {"id": 44, "username": "cohan"},
+        }
+        body = json.dumps(payload).encode()
+        timestamp = str(int(time.time()))
+        headers = {
+            "X-GitLab-Event": "Note Hook",
+            "X-Webhook-Timestamp": timestamp,
+            "X-Webhook-Signature-V2": _generic_v2_signature(body, secret, timestamp),
+        }
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/webhooks/gitlab", data=body, headers=headers)
+            assert resp.status == 202
+        assert captured
+        assert "group/project" in captured[0]
+        assert "https://gitlab.test/group/project/-/issues/7" in captured[0]
+        assert "Please inspect @builder" in captured[0]
+
+
+# ===================================================================
+# GitLab mention profile routing
+# ===================================================================
+
+
+class TestGitLabMentionProfileRouting:
+    """The allow-list target is a routing decision, not a SessionSource identity."""
+
+    _PAYLOAD = {
+        "object_kind": "note",
+        "object_attributes": {"note": "Please inspect @builder", "id": 91},
+        "project": {"id": 12, "path_with_namespace": "group/project",
+                    "web_url": "https://gitlab.test/group/project"},
+        "user": {"id": 44, "username": "cohan"},
+    }
+
+    @staticmethod
+    def _headers(secret: str) -> dict:
+        body = json.dumps(TestGitLabMentionProfileRouting._PAYLOAD).encode()
+        timestamp = str(int(time.time()))
+        return {
+            "X-GitLab-Event": "Note Hook",
+            "X-Webhook-Timestamp": timestamp,
+            "X-Webhook-Signature-V2": _generic_v2_signature(body, secret, timestamp),
+        }
+
+    @pytest.mark.asyncio
+    async def test_single_profile_mention_delivery_is_admitted(self):
+        """A default (non-multiplex) gateway admits a mention instead of retryable-503ing it.
+
+        The target profile is not stamped onto ``SessionSource.profile``: admission refuses a
+        stamped profile when ``multiplex_profiles`` is off, which made every mention delivery a
+        503 that was never dispatched. The target stays in the rendered prompt context.
+        """
+        secret = "mention-secret"
+        routes = {"gitlab": {"secret": secret, "gitlab_mentions": {"profiles": {"builder": "default"}}}}
+        adapter = _make_adapter(routes=routes)
+        adapter._mention_profile_is_served = lambda profile: True
+        assert adapter._multiplex_profiles() is False
+        captured = []
+
+        async def observe(event):
+            captured.append(event)
+
+        adapter.handle_message = observe
+        body = json.dumps(self._PAYLOAD).encode()
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.post("/webhooks/gitlab", data=body, headers=self._headers(secret))
+            assert resp.status == 202
+
+        assert len(captured) == 1
+        event = captured[0]
+        assert not event.source.profile
+        assert event.source.platform is Platform.WEBHOOK
+        assert "Please inspect @builder" in event.text
+        assert '"profile": "default"' in event.text
+
+    @pytest.mark.asyncio
+    async def test_multiplex_gateway_routes_the_mention_target(self):
+        """Under multiplexing the target IS the routed profile and is threaded to admission."""
+        secret = "mention-secret"
+        routes = {"gitlab": {"secret": secret, "gitlab_mentions": {"profiles": {"builder": "builder"}}}}
+        adapter = _make_adapter(routes=routes)
+        adapter._mention_profile_is_served = lambda profile: True
+        adapter._multiplex_profiles = lambda: True
+        captured = []
+
+        async def admit(*args, **kwargs):
+            captured.append(kwargs.get("profile"))
+            return "accepted"
+
+        adapter._admit_agent_run = admit
+        body = json.dumps(self._PAYLOAD).encode()
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.post("/webhooks/gitlab", data=body, headers=self._headers(secret))
+            assert resp.status == 202
+
+        assert captured == ["builder"]
 
 
 # ===================================================================
@@ -527,6 +690,53 @@ class TestHTTPHandling:
 
 
 class TestIdempotency:
+
+    def test_gitlab_delivery_id_precedence(self):
+        """GitLab retry identifiers are stable and outrank transient request ids."""
+        assert _header_delivery_id({"X-Gitlab-Event-UUID": "event-1", "X-Request-ID": "request-1"}) == "event-1"
+        assert _header_delivery_id({"Idempotency-Key": "retry-1", "X-Gitlab-Event-UUID": "event-1"}) == "retry-1"
+        assert _header_delivery_id({"webhook-id": "webhook-1", "Idempotency-Key": "retry-1"}) == "webhook-1"
+
+    @pytest.mark.asyncio
+    async def test_gitlab_idempotency_key_deduplicates_signed_mention_retry(self):
+        """Identical signed GitLab mention retries are delivered once."""
+        secret = "mention-secret"
+        routes = {
+            "gitlab": {
+                "secret": secret,
+                "gitlab_mentions": {"profiles": {"builder": "default"}},
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter._mention_profile_is_served = lambda profile: True
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "object_kind": "note",
+            "object_attributes": {"note": "Please inspect @builder", "id": 91},
+            "project": {"id": 12, "path_with_namespace": "group/project",
+                        "web_url": "https://gitlab.test/group/project"},
+            "user": {"id": 44, "username": "cohan"},
+        }
+        body = json.dumps(payload).encode()
+        timestamp = str(int(time.time()))
+        headers = {
+            "X-GitLab-Event": "Note Hook",
+            "X-Webhook-Timestamp": timestamp,
+            "X-Webhook-Signature-V2": _generic_v2_signature(body, secret, timestamp),
+            "Idempotency-Key": "gitlab-retry-123",
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/gitlab", data=body, headers=headers)
+            second = await cli.post("/webhooks/gitlab", data=body, headers=headers)
+            first_body, second_body = await first.json(), await second.json()
+
+        assert (first.status, first_body["status"]) == (202, "accepted")
+        assert (second.status, second_body["status"]) == (200, "duplicate")
+        assert first_body["delivery_id"] == second_body["delivery_id"] == "gitlab-retry-123"
+        assert adapter.handle_message.await_count == 1
 
     @pytest.mark.asyncio
     async def test_duplicate_delivery_id_returns_200(self):

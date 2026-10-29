@@ -43,6 +43,7 @@ from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coales
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.platforms.webhook_mcp_events import (
     handle_mcp_event_control, mcp_event_delivery_id, render_mcp_event_prompt)
+from gateway.platforms.gitlab_mentions import extract_gitlab_mention, render_gitlab_mention_prompt
 from gateway.response_filters import is_autonomous_silence_response
 
 logger = logging.getLogger(__name__)
@@ -75,9 +76,26 @@ _GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 
 
 def _header_delivery_id(headers) -> str:
-    """The provider's delivery id (GitHub, Svix, Standard Webhooks, generic), else a fresh one."""
-    return headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
-        "webhook-id", headers.get("X-Request-ID", uuid.uuid4().hex))))
+    """Return the most stable provider delivery id available in request headers.
+
+    GitLab retries preserve ``webhook-id`` and ``Idempotency-Key`` (and older
+    installations expose ``X-Gitlab-Event-UUID``), so use those before the
+    generic request id.  A random fallback is intentional for providers that
+    do not supply a retry-stable id.
+    """
+    for name in (
+        # GitLab's retry-stable identifiers take precedence when present.
+        "webhook-id",
+        "Idempotency-Key",
+        "X-Gitlab-Event-UUID",
+        "X-GitHub-Delivery",
+        "svix-id",
+        "X-Request-ID",
+    ):
+        value = headers.get(name)
+        if value:
+            return value
+    return uuid.uuid4().hex
 
 
 @dataclass(frozen=True)
@@ -513,6 +531,10 @@ class WebhookAdapter(BasePlatformAdapter):
     @staticmethod
     def _route_allows_profile(route_config: dict, request_profile: Optional[str]) -> bool:
         """Omitting ``profile`` binds a route to default; an explicit null/blank/non-string fails closed."""
+        # GitLab mention routes select the destination profile from an explicit allow-list after
+        # authenticating and parsing the event. A URL profile still wins and is checked normally.
+        if "profile" not in route_config and isinstance(route_config.get("gitlab_mentions"), dict):
+            return request_profile is None
         configured = route_config.get("profile") if "profile" in route_config else "default"
         if not isinstance(configured, str) or not configured.strip():
             return False
@@ -548,10 +570,35 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] Route %s HMAC secret is missing, blank, or not a string; refusing request",
                          route_name)
             return None, _json_error("Webhook route is missing an HMAC secret", 403)
-        if secret != _INSECURE_NO_AUTH and not self._validate_signature(request, raw_body, secret):
+        mention_route = isinstance(route_config.get("gitlab_mentions"), dict)
+        if mention_route and (secret == _INSECURE_NO_AUTH
+                              or not self._validate_replay_protected_signature(request, raw_body, secret)):
+            logger.warning("[webhook] Invalid or replayable signature for GitLab mention route %s", route_name)
+            return None, _json_error("GitLab mention route requires a replay-protected signature", 401)
+        if not mention_route and secret != _INSECURE_NO_AUTH and not self._validate_signature(request, raw_body, secret):
             logger.warning("[webhook] Invalid signature for route %s", route_name)
             return None, _json_error("Invalid signature", 401)
         return raw_body, None
+
+    def _validate_replay_protected_signature(self, request: web.Request, body: bytes, secret: str) -> bool:
+        """Accept only timestamp-bound Standard Webhooks/Svix or generic V2 signatures."""
+        headers = request.headers
+        # GitLab mention routes must never accept a replayable legacy credential,
+        # even when an attacker also supplies timestamp/signature headers.  The
+        # generic validator checks legacy headers first for compatibility with
+        # existing non-mention routes, so reject the mixed form here before
+        # delegating to it.
+        if any(headers.get(name, "") for name in (
+                "X-Gitlab-Token", "X-Webhook-Signature", "linear-signature", "X-Hub-Signature-256")):
+            return False
+        standard = tuple(headers.get(name, "") for name in
+                        ("webhook-id", "webhook-timestamp", "webhook-signature"))
+        svix = tuple(headers.get(name, "") for name in ("svix-id", "svix-timestamp", "svix-signature"))
+        if all(standard) or all(svix):
+            return self._validate_signature(request, body, secret)
+        if headers.get("X-Webhook-Signature-V2") and headers.get("X-Webhook-Timestamp"):
+            return self._validate_signature(request, body, secret)
+        return False
 
     @staticmethod
     def _parse_body(raw_body: bytes) -> Any:
@@ -667,6 +714,7 @@ class WebhookAdapter(BasePlatformAdapter):
             raw_body, error_response = await self._read_authenticated_body(request, route_name, route_config)
         if error_response is not None:
             return error_response
+        assert route_config is not None
         headers = request.headers
         delivery_id = _header_delivery_id(headers)
         # A parked profile is retried, before any delivery id is recorded. The check resolves
@@ -689,6 +737,31 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery_id = mcp_event_delivery_id(route_config, payload) or delivery_id
         event_type = (headers.get("X-GitHub-Event", "") or headers.get("X-GitLab-Event", "")
                       or payload.get("event_type", "") or payload.get("type", "") or "unknown")
+        mention_settings = route_config.get("gitlab_mentions")
+        mention_context = None
+        mention_prompt = None
+        if isinstance(mention_settings, dict):
+            if not headers.get("X-GitLab-Event") and event_type not in {
+                    "Issue Hook", "Merge Request Hook", "Note Hook"}:
+                return web.json_response({"status": "ignored", "reason": "unsupported_gitlab_event"})  # type: ignore[union-attr]
+            mapping = mention_settings.get("profiles", {})
+            mention_context = extract_gitlab_mention(payload, event_type, mapping)
+            if mention_context is None:
+                return web.json_response({"status": "ignored", "reason": "no_allowed_mention"})  # type: ignore[union-attr]
+            mention_target = mention_context["profile"]
+            if not self._mention_profile_is_served(mention_target):
+                return _json_error("Mention target profile is not served", 404)
+            # The allow-list target is a ROUTING decision, not a source identity. Only a multiplexed
+            # gateway serves it as a routed profile; on a single-profile gateway the delivery is
+            # admitted under the profile this gateway already serves — the same rule
+            # ``_resolve_request_profile`` applies to a self-referential ``/p/<profile>/`` prefix.
+            # Stamping it onto ``SessionSource.profile`` here made every mention delivery fail
+            # admission (session_ingress_context ``profile_mismatch``) as a retryable 503 that was
+            # never dispatched. The target stays in the rendered prompt context.
+            profile = mention_target if self._multiplex_profiles() else None
+            mention_prompt = render_gitlab_mention_prompt(mention_context, route_config.get("prompt", ""))
+            if request.query.get("dry_run") == "1" or mention_settings.get("dry_run") is True:
+                return web.json_response({"status": "dry_run", "context": mention_context}, status=200)  # type: ignore[union-attr]
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug("[webhook] Ignoring event %s for route %s (allowed: %s)", event_type, route_name,
@@ -711,8 +784,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload or payload
-            prompt = (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
-                      or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name))
+            prompt = (mention_prompt if mention_prompt is not None else
+                      (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
+                       or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name)))
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
             if (skills := route_config.get("skills", [])) and not route_config.get("cron_job"):
                 prompt = self._apply_skills(prompt, skills)
@@ -739,6 +813,22 @@ class WebhookAdapter(BasePlatformAdapter):
                                       "delivery_id": delivery_id}, status=202)
         return await self._dispatch_agent_run(request, route_config, route_name, profile, payload, prompt, event_type,
                                         delivery_id, now)
+
+    def _multiplex_profiles(self) -> bool:
+        """Whether this gateway serves more than its primary profile as routed profiles."""
+        return bool(getattr(getattr(self.gateway_runner, "config", None), "multiplex_profiles", False))
+
+    def _mention_profile_is_served(self, profile: str) -> bool:
+        """Fail closed unless the target is one of the profiles served by this gateway."""
+        if not isinstance(profile, str) or not profile.strip():
+            return False
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+            served = {name for name, _ in profiles_to_serve(multiplex=self._multiplex_profiles())}
+            return profile in served
+        except Exception:
+            logger.warning("[webhook] GitLab mention target profile is unavailable")
+            return False
 
     async def _dispatch_agent_run(self, request, route_config: dict, route_name: str, profile, payload: Any, prompt: str,
                             event_type: str, delivery_id: str, now: float) -> web.Response:

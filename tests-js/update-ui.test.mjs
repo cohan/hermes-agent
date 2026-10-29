@@ -170,7 +170,9 @@ test.skipIf(process.platform === 'win32')('probe Git reaches the staged main eve
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
-})
+  // Four real Python launcher runs plus ~20 git spawns; vitest's 5s default is a cold-start budget,
+  // not a wall-clock bound once the JS job is running four workspace checks on 4 vCPUs.
+}, 30_000)
 
 test.skipIf(process.platform === 'win32')('historical venv install without a PM launcher still checks staged Git main', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-legacy-branch-'))
