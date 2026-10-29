@@ -73,6 +73,7 @@ def diagnostic_event(ev) -> bool:
 # every 5 seconds forever. A genuinely dead chat still drops, just ~60s later — a fine trade for an
 # unattended gate where a false drop means silent work pileup.
 MAX_SEND_FAILURES = 12
+_WIKI_TABLET_ROUTE_LOGGED = False
 
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
@@ -497,6 +498,7 @@ class _KanbanNotification:
     """
 
     def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict) -> None:
+        global _WIKI_TABLET_ROUTE_LOGGED
         self.runner = runner
         self.d = d
         self.platform_cls = platform_cls
@@ -517,6 +519,18 @@ class _KanbanNotification:
         mode = sub.get("delivery_mode") or "notify"
         self.wake_agent = mode in ("notify+wake", "wake")
         self.send_passive = mode != "wake"
+        self.wiki_to_tablet = False
+        try:
+            from gateway.kanban_wiki_notice import tablet_enabled, wiki_update_task
+            self.wiki_to_tablet = wiki_update_task(task) and tablet_enabled()
+        except Exception as exc:
+            # This optional route must never stop notifier startup or delivery.
+            logger.warning("kanban notifier: wiki tablet route unavailable: %s", exc)
+        if self.wiki_to_tablet:
+            self.wake_agent = False
+            if not _WIKI_TABLET_ROUTE_LOGGED:
+                logger.info("kanban notifier: wiki-update notices routed to tablet (telegram suppressed)")
+                _WIKI_TABLET_ROUTE_LOGGED = True
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
@@ -713,6 +727,21 @@ class _KanbanNotification:
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
+                continue
+            if self.wiki_to_tablet:
+                try:
+                    from gateway.kanban_wiki_notice import post_wiki_notice
+                    if not post_wiki_notice(self.title[:60], msg):
+                        logger.warning("kanban notifier: tablet wiki notice was not accepted for %s", self.task_id)
+                except Exception as exc:
+                    # The tablet route is best effort: consume the event even when its
+                    # optional module or receiver cannot accept the notice.
+                    logger.warning("kanban notifier: tablet wiki notice failed for %s: %s", self.task_id, exc)
+                await _to_thread_process_service(partial(
+                    self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
+                    event_id=ev.id,
+                ))
+                self.clear_failures()
                 continue
             # Non-push adapters (api_server) always report SendResult(success=False)
             # from send(); treating that as failure would drop the sub forever and
