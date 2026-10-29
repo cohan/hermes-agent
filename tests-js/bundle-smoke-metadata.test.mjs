@@ -107,9 +107,11 @@ test('channel smoke binds the complete admitted request, not a commit-build iden
       { ...request, windowsVersion: '1.2.3.0' }, { ...request, identity: { token } }]) {
       fs.writeFileSync(requestPath, JSON.stringify(invalid))
       expect(run('identity').status).not.toBe(0)
-    }
-  } finally { fs.rmSync(temp, { recursive: true, force: true }) }
-}, 15_000)
+      }
+      } finally { fs.rmSync(temp, { recursive: true, force: true }) }
+      // ~30 cold `node` spawns. The JS job runs four workspace checks on 4 vCPUs, so the cap has to
+      // cover host contention as well as this test's own work (15s starved it on the hosted runner).
+      }, 60_000)
 
 test('workspace admission rejects reuse and symlink escapes before creating anything outside runner temp', () => {
   const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-paths-')))
