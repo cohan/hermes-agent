@@ -624,9 +624,8 @@ def _git_exec_path_candidates() -> list:
     """
     out = []
     with suppress(Exception):
-        probe = subprocess.run(["git", "--exec-path"], capture_output=True, text=True,
-                               encoding="utf-8", errors="replace",
-                               creationflags=windows_hide_flags(), timeout=15, check=False)
+        probe = subprocess.run(["git", "--exec-path"], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", creationflags=windows_hide_flags(), timeout=15, check=False)
         if probe.returncode == 0 and probe.stdout.strip():
             candidate = Path(probe.stdout.strip()) / "git.exe"
             if candidate.exists():
