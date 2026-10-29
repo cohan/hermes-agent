@@ -43,6 +43,22 @@ Only exact configured usernames route. `a@builder.test`, unknown usernames, and 
 unscanned fields are ignored. The prompt preserves the GitLab project id/path/URL, author id and
 username, object id/iid/URL, event type, full comment text, and selected username.
 
+## Profile routing
+
+`gitlab_mentions.profiles` is an allow-list: a mention only dispatches when its username maps to a
+profile this gateway serves, and any other target answers `404` (`Mention target profile is not
+served`) — non-retryable, so GitLab does not replay it forever.
+
+On a **single-profile** gateway (`gateway.multiplex_profiles` off, the default) the mapping is a
+routing decision, not a source identity: the delivery is admitted under the one profile the gateway
+runs, and the selected target is recorded in the prompt context only. A mapping that names any other
+profile answers `404`, so it fails closed instead of running under the wrong profile.
+
+Delivering a mention **to a different profile** requires a multiplexed gateway
+(`gateway.multiplex_profiles: true`) serving that profile; the target is then stamped onto the run as
+its routed profile and the reply egresses through that profile's adapters and credentials. The
+mapping in the example above (assistant/builder/ops/researcher) assumes exactly that setup.
+
 ## Dry-run readback
 
 Send the same signed request to the route with `?dry_run=1`. A `200` response contains

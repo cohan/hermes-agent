@@ -458,6 +458,88 @@ class TestEventFilter:
 
 
 # ===================================================================
+# GitLab mention profile routing
+# ===================================================================
+
+
+class TestGitLabMentionProfileRouting:
+    """The allow-list target is a routing decision, not a SessionSource identity."""
+
+    _PAYLOAD = {
+        "object_kind": "note",
+        "object_attributes": {"note": "Please inspect @builder", "id": 91},
+        "project": {"id": 12, "path_with_namespace": "group/project",
+                    "web_url": "https://gitlab.test/group/project"},
+        "user": {"id": 44, "username": "cohan"},
+    }
+
+    @staticmethod
+    def _headers(secret: str) -> dict:
+        body = json.dumps(TestGitLabMentionProfileRouting._PAYLOAD).encode()
+        timestamp = str(int(time.time()))
+        return {
+            "X-GitLab-Event": "Note Hook",
+            "X-Webhook-Timestamp": timestamp,
+            "X-Webhook-Signature-V2": _generic_v2_signature(body, secret, timestamp),
+        }
+
+    @pytest.mark.asyncio
+    async def test_single_profile_mention_delivery_is_admitted(self):
+        """A default (non-multiplex) gateway admits a mention instead of retryable-503ing it.
+
+        The target profile is not stamped onto ``SessionSource.profile``: admission refuses a
+        stamped profile when ``multiplex_profiles`` is off, which made every mention delivery a
+        503 that was never dispatched. The target stays in the rendered prompt context.
+        """
+        secret = "mention-secret"
+        routes = {"gitlab": {"secret": secret, "gitlab_mentions": {"profiles": {"builder": "default"}}}}
+        adapter = _make_adapter(routes=routes)
+        adapter._mention_profile_is_served = lambda profile: True
+        assert adapter._multiplex_profiles() is False
+        captured = []
+
+        async def observe(event):
+            captured.append(event)
+
+        adapter.handle_message = observe
+        body = json.dumps(self._PAYLOAD).encode()
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.post("/webhooks/gitlab", data=body, headers=self._headers(secret))
+            assert resp.status == 202
+
+        assert len(captured) == 1
+        event = captured[0]
+        assert not event.source.profile
+        assert event.source.platform is Platform.WEBHOOK
+        assert "Please inspect @builder" in event.text
+        assert '"profile": "default"' in event.text
+
+    @pytest.mark.asyncio
+    async def test_multiplex_gateway_routes_the_mention_target(self):
+        """Under multiplexing the target IS the routed profile and is threaded to admission."""
+        secret = "mention-secret"
+        routes = {"gitlab": {"secret": secret, "gitlab_mentions": {"profiles": {"builder": "builder"}}}}
+        adapter = _make_adapter(routes=routes)
+        adapter._mention_profile_is_served = lambda profile: True
+        adapter._multiplex_profiles = lambda: True
+        captured = []
+
+        async def admit(*args, **kwargs):
+            captured.append(kwargs.get("profile"))
+            return "accepted"
+
+        adapter._admit_agent_run = admit
+        body = json.dumps(self._PAYLOAD).encode()
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            resp = await cli.post("/webhooks/gitlab", data=body, headers=self._headers(secret))
+            assert resp.status == 202
+
+        assert captured == ["builder"]
+
+
+# ===================================================================
 # Payload filters
 # ===================================================================
 
@@ -649,9 +731,11 @@ class TestIdempotency:
         async with TestClient(TestServer(app)) as cli:
             first = await cli.post("/webhooks/gitlab", data=body, headers=headers)
             second = await cli.post("/webhooks/gitlab", data=body, headers=headers)
+            first_body, second_body = await first.json(), await second.json()
 
-        assert (first.status, (await first.json())["status"]) == (202, "accepted")
-        assert (second.status, (await second.json())["status"]) == (200, "duplicate")
+        assert (first.status, first_body["status"]) == (202, "accepted")
+        assert (second.status, second_body["status"]) == (200, "duplicate")
+        assert first_body["delivery_id"] == second_body["delivery_id"] == "gitlab-retry-123"
         assert adapter.handle_message.await_count == 1
 
     @pytest.mark.asyncio

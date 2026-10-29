@@ -748,9 +748,17 @@ class WebhookAdapter(BasePlatformAdapter):
             mention_context = extract_gitlab_mention(payload, event_type, mapping)
             if mention_context is None:
                 return web.json_response({"status": "ignored", "reason": "no_allowed_mention"})  # type: ignore[union-attr]
-            profile = mention_context["profile"]
-            if not self._mention_profile_is_served(profile):
+            mention_target = mention_context["profile"]
+            if not self._mention_profile_is_served(mention_target):
                 return _json_error("Mention target profile is not served", 404)
+            # The allow-list target is a ROUTING decision, not a source identity. Only a multiplexed
+            # gateway serves it as a routed profile; on a single-profile gateway the delivery is
+            # admitted under the profile this gateway already serves — the same rule
+            # ``_resolve_request_profile`` applies to a self-referential ``/p/<profile>/`` prefix.
+            # Stamping it onto ``SessionSource.profile`` here made every mention delivery fail
+            # admission (session_ingress_context ``profile_mismatch``) as a retryable 503 that was
+            # never dispatched. The target stays in the rendered prompt context.
+            profile = mention_target if self._multiplex_profiles() else None
             mention_prompt = render_gitlab_mention_prompt(mention_context, route_config.get("prompt", ""))
             if request.query.get("dry_run") == "1" or mention_settings.get("dry_run") is True:
                 return web.json_response({"status": "dry_run", "context": mention_context}, status=200)  # type: ignore[union-attr]
@@ -806,14 +814,17 @@ class WebhookAdapter(BasePlatformAdapter):
         return await self._dispatch_agent_run(request, route_config, route_name, profile, payload, prompt, event_type,
                                         delivery_id, now)
 
+    def _multiplex_profiles(self) -> bool:
+        """Whether this gateway serves more than its primary profile as routed profiles."""
+        return bool(getattr(getattr(self.gateway_runner, "config", None), "multiplex_profiles", False))
+
     def _mention_profile_is_served(self, profile: str) -> bool:
         """Fail closed unless the target is one of the profiles served by this gateway."""
         if not isinstance(profile, str) or not profile.strip():
             return False
         try:
             from hermes_cli.profiles import profiles_to_serve
-            served = {name for name, _ in profiles_to_serve(
-                multiplex=bool(getattr(getattr(self.gateway_runner, "config", None), "multiplex_profiles", False)))}
+            served = {name for name, _ in profiles_to_serve(multiplex=self._multiplex_profiles())}
             return profile in served
         except Exception:
             logger.warning("[webhook] GitLab mention target profile is unavailable")
