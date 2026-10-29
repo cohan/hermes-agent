@@ -395,16 +395,6 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             raise corrupt_store_status(db_path, exc) from exc
         if isinstance(exc, sqlite3.OperationalError) and is_transient_sqlite_error(exc):
             detail = "Session store is busy (disk I/O or lock). Retry; the list was not cleared."
-        elif is_declarative_drift_error(exc):
-            # Drift that survived the reconcile above (the reopen after it can still see a missing
-            # column). That is a lagging store, never corruption: name the repair, which has no
-            # time limit, instead of telling the user to restart a gateway that may not run.
-            from hermes_state_reconcile import _owner_remedy, _repair_command
-            label, _ = _owner_remedy(db_path.parent)
-            detail = (
-                f"Session store for profile '{label}' is behind this Hermes version ({exc}); "
-                f"nothing was changed. Run `{_repair_command(db_path.parent)}` to bring it up to "
-                "date, then reload.")
         else:
             # The 503 below is generic; log what actually failed so an unexpected engine error is
             # diagnosable instead of arriving as "unavailable or corrupt".
