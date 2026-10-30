@@ -38,8 +38,8 @@ class WorktreeUnavailable(ValueError):
         self.task_id = task_id
         self.path = path
         super().__init__(
-            f"task {task_id} worktree path {path!r} is not inside a git repo "
-            "and does not point at a git repo root"
+            f"task {task_id} workspace_kind=worktree has workspace_path {path!r} "
+            "that is not inside a git repo and does not point at a git repo root"
         )
 
 
@@ -794,10 +794,12 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
-        raise ValueError(
-            f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
-            "and does not point at a git repo root"
-        )
+        # No repo anywhere above the named path, and the path is not one: there
+        # is nothing to branch from. The worktree kind is a collision-safety
+        # contract, so this is a hard failure the dispatcher records — it must
+        # never fall back to a shared ``dir``/``scratch`` workspace, which is
+        # the very collision this kind exists to prevent.
+        raise WorktreeUnavailable(task.id, str(task.workspace_path))
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 

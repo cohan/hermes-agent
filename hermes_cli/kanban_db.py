@@ -1153,6 +1153,223 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _assignee_loadable_skills(assignee: Optional[str]) -> Optional[frozenset[str]]:
+    """Skill names the *assignee's* profile can actually load, or ``None`` when
+    that cannot be determined.
+
+    A ``skills:`` pin the assignee cannot resolve is a hard startup failure —
+    the worker runs ``hermes -p <assignee> --skills <name>`` and exits 1 with
+    ``Unknown skill(s): <name>`` before it ever reaches the task, so the card
+    is dispatchable on paper and dead in practice (t_e7d0f1b2). The pin must be
+    judged against the profile that will run it, not the creator's.
+
+    ``None`` means "could not tell" (no profile dir, unreadable config, scan
+    failure): the caller then keeps the creator's pin, because a validator must
+    never rewrite intent on a failure of its own. An empty set is a real answer
+    — a profile with no skills can load no pins.
+    """
+    if not assignee:
+        return None
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        home = resolve_profile_env(assignee)
+    except Exception:
+        return None
+    if not home or not Path(home).is_dir():
+        return None
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    except Exception:
+        return None
+    token = None
+    try:
+        token = set_hermes_home_override(home)
+        from agent.skill_commands import get_skill_commands
+
+        # The scan is home-keyed, so binding the assignee's home yields exactly
+        # the set its worker's ``--skills`` preload resolves against.
+        commands = get_skill_commands() or {}
+    except Exception:
+        return None
+    finally:
+        if token is not None:
+            try:
+                reset_hermes_home_override(token)
+            except Exception:
+                pass
+    names: set[str] = set()
+    for key, info in commands.items():
+        text = str(key or "").strip().lstrip("/")
+        if text:
+            names.add(text.casefold())
+        if isinstance(info, dict):
+            value = str(info.get("name") or "").strip()
+            if value:
+                names.add(value.casefold())
+    return frozenset(names)
+
+
+def _drop_unloadable_skills(
+    skills_list: Optional[list[str]], assignee: Optional[str],
+) -> tuple[Optional[list[str]], list[str]]:
+    """``(kept, dropped)`` for a skills pin the assignee cannot load.
+
+    Dropping the pin (rather than the card) is the same rule the provider pin
+    follows: the card runs with the assignee's default skills and stays
+    dispatchable, and the drop is reported on the card so it is never silent.
+    """
+    if not skills_list or not assignee:
+        return skills_list, []
+    loadable = _assignee_loadable_skills(assignee)
+    if loadable is None:
+        return skills_list, []
+    kept = [name for name in skills_list if name.casefold() in loadable]
+    dropped = [name for name in skills_list if name.casefold() not in loadable]
+    if not dropped:
+        return skills_list, []
+    return (kept or None), dropped
+
+
+def _dropped_skills_comment(
+    dropped: list[str], kept: Optional[list[str]], assignee: Optional[str],
+) -> str:
+    """The card comment explaining a dropped skill pin — names the skills, the
+    profile they were checked against, and what the card now runs with."""
+    pins = ", ".join(f"`{name}`" for name in dropped)
+    where = f"`{assignee}`" if assignee else "the assignee"
+    kept_text = (
+        f"Kept: {', '.join(f'`{n}`' for n in kept)}." if kept
+        else "No skill pin was stored."
+    )
+    return (
+        f"**Skill pin dropped at creation:** {pins} not a skill {where} can load, so the "
+        f"`--skills` preload the dispatcher would have built exits 1 with "
+        f"`Unknown skill(s)` before the worker reaches the card. {kept_text} Install the "
+        f"skill into {where}'s skills directory (or drop the pin deliberately) if it "
+        f"mattered to this card."
+    )
+
+
+def _record_dropped_skills(
+    conn: sqlite3.Connection, task_id: str, assignee: Optional[str],
+    dropped: list[str], kept: Optional[list[str]], *, author: Optional[str],
+) -> None:
+    """Report a dropped skills pin on the card: an event for machines, a comment
+    for the creator. Silent dropping would trade one invisible failure for another."""
+    _append_event(
+        conn, task_id, "skill_pin_dropped",
+        {"skills": list(dropped), "kept": list(kept or []), "assignee": assignee,
+         "reason": "skill_not_loadable_by_assignee"},
+    )
+    add_comment(
+        conn, task_id, author=(author or "kanban").strip() or "kanban",
+        body=_dropped_skills_comment(dropped, kept, assignee),
+    )
+
+
+class WorkspaceContractError(ValueError):
+    """A card's workspace can never be resolved, refused at creation.
+
+    The dispatcher's spawn-time refusal (``repo-backed task ... uses dir
+    workspace`` / ``worktree path ... is not inside a git repo``) is right but
+    arrives after a claim and a retry have been spent. This is the same
+    judgement one step earlier, so a card that can never run is not filed.
+    """
+
+
+def _git_toplevel_for(path: Path) -> Optional[Path]:
+    """Git toplevel at or above *path* (walking up through missing components)."""
+    current = path
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    try:
+        current = current.resolve(strict=False)
+    except OSError:
+        return None
+    out = _git_out(current, "rev-parse", "--show-toplevel")
+    if not out:
+        return None
+    try:
+        return Path(out).expanduser().resolve(strict=False)
+    except OSError:
+        return Path(out).expanduser()
+
+
+def _validate_workspace_contract(
+    workspace_kind: Optional[str],
+    workspace_path: Optional[str],
+    *,
+    allow_repo_dir: bool = False,
+    project_repo: Optional[str] = None,
+) -> None:
+    """Refuse, at creation, a workspace the dispatcher would refuse at spawn.
+
+    Two shapes, both of which used to pass creation and die at spawn:
+
+    * ``worktree`` whose path is not in a git repo (``/tmp``, empty, a plain
+      directory) — there is nothing to branch from.
+    * ``dir`` pointing at a repo or anywhere inside one — the old collision
+      hazard that ``worktree`` exists to prevent.
+
+    The messages name the field and the fix, because the common mistake is the
+    right intent written with the wrong kind. ``allow_repo_dir`` is the
+    opt-out for the deliberate "read this repo from a shared directory" case.
+    """
+    if workspace_kind == "worktree":
+        if project_repo:
+            # The path is derived as ``<project repo>/.worktrees/<task id>``
+            # inside the insert txn, so it is repo-backed by construction.
+            return
+        if not workspace_path:
+            raise WorkspaceContractError(
+                "workspace_kind=worktree needs a git repo but workspace_path is empty: "
+                "pass an absolute path inside a git repo (--workspace worktree:<path>), "
+                "or link the card to a project (project=...) so its repo is known"
+            )
+        path = Path(workspace_path).expanduser()
+        if not path.is_absolute():
+            raise WorkspaceContractError(
+                f"workspace_path {workspace_path!r} for workspace_kind=worktree is not "
+                f"absolute; use an absolute path inside a git repo"
+            )
+        if _git_toplevel_for(path) is None:
+            raise WorkspaceContractError(
+                f"workspace_path {workspace_path!r} for workspace_kind=worktree is not "
+                f"inside a git repo and does not point at a git repo root; point it at an "
+                f"absolute path inside a git repo, or create the card with "
+                f"workspace_kind=scratch"
+            )
+        return
+    if workspace_kind != "dir":
+        return
+    if not workspace_path:
+        raise WorkspaceContractError(
+            "workspace_kind=dir needs workspace_path: an absolute path to a shared, "
+            "non-repo directory (use workspace_kind=worktree for a repo)"
+        )
+    path = Path(workspace_path).expanduser()
+    if not path.is_absolute():
+        raise WorkspaceContractError(
+            f"workspace_path {workspace_path!r} is not absolute; use an absolute path "
+            f"(relative paths are ambiguous against the dispatcher's CWD)"
+        )
+    if allow_repo_dir:
+        return
+    # An existing linked worktree checkout is already isolated, and the
+    # spawn-time check lets it through; mirror that here.
+    if path.exists() and _is_linked_worktree_checkout(path):
+        return
+    if _git_toplevel_for(path) is not None:
+        raise WorkspaceContractError(
+            f"repo-backed task uses dir workspace {path}; workspace_kind=dir is for a "
+            f"shared non-repo directory. Use workspace_kind=worktree (optionally with a "
+            f"project) so the worker gets its own checkout; if reading this repo from a "
+            f"shared directory is deliberate, pass allow_repo_dir=True "
+            f"(CLI: --allow-repo-dir)"
+        )
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1167,6 +1384,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    allow_repo_dir: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1220,6 +1438,10 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    # A skill pin the assignee cannot load kills the worker at startup
+    # (``Unknown skill(s)``), so it is dropped at creation and reported on the
+    # card — never stored as a pin that guarantees the dispatch fails.
+    skills_list, dropped_skills = _drop_unloadable_skills(skills_list, assignee)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1240,6 +1462,13 @@ def create_task(
         board_default = _board_meta_for(board).get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    # A workspace the dispatcher can never resolve is refused HERE, at filing
+    # time, instead of after the card has burned its retry budget at spawn.
+    _validate_workspace_contract(
+        workspace_kind, workspace_path,
+        allow_repo_dir=allow_repo_dir, project_repo=project_repo,
+    )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -1301,6 +1530,13 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if dropped_skills:
+                    # A pin the assignee cannot load is dropped, not stored: the
+                    # card stays dispatchable and the creator is told on the card why.
+                    _record_dropped_skills(
+                        conn, task_id, assignee, dropped_skills, skills_list,
+                        author=created_by,
+                    )
                 if task_status == "blocked":
                     _append_event(
                         conn,
@@ -4223,6 +4459,7 @@ from hermes_cli.kanban_db_connect import (
 )
 from hermes_cli.kanban_db_workspace import (
     _cleanup_workspace,
+    _is_linked_worktree_checkout,
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,

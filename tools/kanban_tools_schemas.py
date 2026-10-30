@@ -445,8 +445,18 @@ KANBAN_CREATE_SCHEMA = _schema(
         },
         "workspace_path": _prop("string", (
                 "Absolute path for 'dir' or 'worktree' workspace. "
-                "Relative paths are rejected at dispatch."
+                "Relative paths are rejected at dispatch. A 'worktree' path must "
+                "be inside a git repo (or be one); a 'dir' path must not be inside "
+                "a git repo unless allow_repo_dir is set."
         )),
+        "allow_repo_dir": {
+            "type": "boolean",
+            "description": (
+                "Opt out of the default refusal of workspace_kind='dir' inside a "
+                "git repo. Only for a card that deliberately wants to read a repo "
+                "from a shared directory; edits want workspace_kind='worktree'."
+            ),
+        },
         "project": _prop("string", (
                 "Optional project id or slug to link the task to. When "
                 "set, the task becomes a git worktree under the project's "

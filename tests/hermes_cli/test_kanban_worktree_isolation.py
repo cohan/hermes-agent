@@ -129,5 +129,132 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     assert head == "wt/sibling"
 
 
+def _legacy_worktree_card(conn, *, title, workspace_path, branch_name=None):
+    """A worktree card as it exists BEFORE creation-time validation.
 
+    ``create_task`` now refuses a repo-less worktree outright (see
+    tests/hermes_cli/test_kanban_workspace_contract.py). The spawn-time
+    refusal still has to hold for rows already on the board — the eight cards
+    filed before that check — so these tests forge the row.
+    """
+    tid = kb.create_task(conn, title=title)
+    conn.execute(
+        "UPDATE tasks SET workspace_kind = 'worktree', workspace_path = ?, "
+        "branch_name = ? WHERE id = ?",
+        (workspace_path, branch_name, tid),
+    )
+    conn.commit()
+    return tid
+
+
+def test_worktree_path_outside_a_repo_is_reported_as_unavailable(kanban_home, tmp_path):
+    """No repo above the named path: the resolver flags it for a downgrade
+    instead of claiming the path is a broken repo."""
+    plain = tmp_path / "not-a-repo" / "wt-target"
+
+    with kbc.connect() as conn:
+        tid = _legacy_worktree_card(conn, title="work outside git", workspace_path=str(plain))
+        task = kb.get_task(conn, tid)
+
+    with pytest.raises(kbw.WorktreeUnavailable):
+        kbw._resolve_worktree_workspace(task)
+
+
+def test_worktree_without_a_repo_stays_a_worktree(kanban_home, tmp_path):
+    """There is no downgrade path any more: a worktree task whose path has no
+    repo is reported unavailable and the card stays a worktree card. Turning it
+    into a shared ``dir`` is the collision hazard the kind exists to prevent —
+    see tests/hermes_cli/test_kanban_work_guard.py for the dispatcher-side proof."""
+    plain = tmp_path / "not-a-repo" / "wt-target"
+
+    with kbc.connect() as conn:
+        tid = _legacy_worktree_card(
+            conn, title="work outside git", workspace_path=str(plain),
+            branch_name="wt/ghost",
+        )
+        task = kb.get_task(conn, tid)
+        with pytest.raises(kbw.WorktreeUnavailable):
+            kbw._resolve_worktree_workspace(task)
+        # Still a worktree card, and no downgrade event was written.
+        row = conn.execute(
+            "SELECT workspace_kind, branch_name FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["workspace_kind"] == "worktree"
+        assert row["branch_name"] == "wt/ghost"
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'workspace_downgraded'",
+            (tid,),
+        ).fetchone()
+
+
+def test_dispatch_refuses_a_repo_less_worktree_card_instead_of_downgrading(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """End to end through the dispatcher: a worktree card whose (board-inherited)
+    path is not a git repo is a broken COLLISION-SAFETY contract. It must not be
+    spawned as a shared ``dir`` card — no worker is placed, and the failure is
+    recorded for the orchestrator to repair the project link."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    non_repo = kanban_home / "not-a-repo"
+    non_repo.mkdir()
+    monkeypatch.setattr(
+        kbw._kb, "read_board_metadata", lambda *a, **k: {"default_workdir": str(non_repo)}
+    )
+
+    seen: list[tuple[str, str]] = []
+
+    def _fake_spawn(task, workspace, board=None):
+        seen.append((task.workspace_kind, str(workspace)))
+        return 0  # falsy pid: dispatch records no worker_pid
+
+    with kbc.connect() as conn:
+        tid = _legacy_worktree_card(conn, title="worktree, no repo", workspace_path=None)
+        conn.execute("UPDATE tasks SET assignee = 'alice' WHERE id = ?", (tid,))
+        conn.commit()
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+        assert seen == [], "a repo-less worktree card was spawned into a shared workspace"
+        assert not res.spawned
+        row = conn.execute(
+            "SELECT workspace_kind, branch_name, last_failure_error FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        # Still a worktree card — never silently switched to a shared dir.
+        assert row["workspace_kind"] == "worktree"
+        assert row["branch_name"] is None
+        assert "workspace:" in (row["last_failure_error"] or "")
+
+
+def test_board_default_workdir_that_is_not_a_repo_is_refused_not_scratch(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """A card with no path of its own (a decompose child, say) on a board whose
+    default_workdir is not a repo has nowhere to branch. Scratch is a shared
+    workspace, so the guard refuses rather than dropping a code card into it."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    non_repo = kanban_home / "not-a-repo"
+    non_repo.mkdir()
+    monkeypatch.setattr(
+        kbw._kb, "read_board_metadata", lambda *a, **k: {"default_workdir": str(non_repo)}
+    )
+
+    seen: list[tuple[str, str]] = []
+
+    def _fake_spawn(task, workspace, board=None):
+        seen.append((task.workspace_kind, str(workspace)))
+        return 0
+
+    with kbc.connect() as conn:
+        tid = _legacy_worktree_card(conn, title="worktree, no path", workspace_path=None)
+        conn.execute("UPDATE tasks SET assignee = 'alice' WHERE id = ?", (tid,))
+        conn.commit()
+        res = kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+        assert seen == [], "a repo-less worktree card was dropped into scratch"
+        assert not res.spawned
+        assert conn.execute(
+            "SELECT workspace_kind FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["workspace_kind"] == "worktree"
 

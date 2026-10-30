@@ -170,6 +170,11 @@ _SPECS = [
              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
                   "an explicit 'scratch' also opts out of a project-scoped board's project)"),
         _arg("--branch", help="Branch name for worktree tasks, e.g. wt/t6-wire"),
+        _arg("--allow-repo-dir", action="store_true", dest="allow_repo_dir",
+             help="Permit --workspace dir:<path> when the path is a git repo (or inside "
+                  "one). Creation refuses that by default — it is the collision hazard "
+                  "worktree exists to prevent — unless reading the repo from a shared "
+                  "directory is what the card actually needs."),
         _arg("--project",
              help="Link to a project (id or slug). Anchors the task's "
                   "worktree under the project's primary repo with a "

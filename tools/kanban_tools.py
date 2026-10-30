@@ -1135,6 +1135,7 @@ def _handle_create(args: dict, **kw) -> str:
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
+            allow_repo_dir=_parse_bool_arg(args, "allow_repo_dir"),
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
             board=args.get("board"),
@@ -1148,9 +1149,15 @@ def _handle_create(args: dict, **kw) -> str:
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
+        events = kb.list_events(conn, new_tid)
+        wait = [e for e in events if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
-        return _ok(task_id=new_tid, **landed, **gate,
+        # A skill pin the assignee cannot load is dropped at creation
+        # (kanban_db.create_task) and reported on the card. Repeat it here so the
+        # creator sees it in-band rather than only when it next reads the card.
+        skill_drops = [e for e in events if e.kind == "skill_pin_dropped"]
+        reported = {"skill_pins_dropped": skill_drops[-1].payload} if skill_drops else {}
+        return _ok(task_id=new_tid, **landed, **gate, **reported,
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 

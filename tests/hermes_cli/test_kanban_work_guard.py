@@ -69,6 +69,23 @@ def _recorded_spawns() -> tuple[list, callable]:
     return seen, _spawn
 
 
+def _legacy_card(conn, title, *, workspace_kind, workspace_path=None):
+    """Forge a card row as it exists on the board BEFORE creation-time validation.
+
+    ``create_task`` now refuses a repo-less worktree (and a ``dir`` inside a repo)
+    outright, so the spawn-time refusal these tests cover can only be exercised
+    with a row forged directly — the shape of the cards already on the board.
+    """
+    tid = kb.create_task(conn, title=title, assignee="alice")
+    conn.execute(
+        "UPDATE tasks SET workspace_kind = ?, workspace_path = ?, assignee = 'alice' "
+        "WHERE id = ?",
+        (workspace_kind, workspace_path, tid),
+    )
+    conn.commit()
+    return tid
+
+
 def _row(conn, tid):
     return conn.execute(
         "SELECT workspace_kind, workspace_path, status, consecutive_failures, "
@@ -90,9 +107,7 @@ def test_worktree_card_without_a_repo_is_refused_not_downgraded(
     seen, spawn = _recorded_spawns()
 
     with kbc.connect() as conn:
-        tid = kb.create_task(
-            conn, title="worktree, no repo", assignee="alice", workspace_kind="worktree",
-        )
+        tid = _legacy_card(conn, "worktree, no repo", workspace_kind="worktree")
         before = _row(conn, tid)
         res = kbd.dispatch_once(conn, spawn_fn=spawn)
 
@@ -123,9 +138,7 @@ def test_repeat_failures_auto_block_the_repo_less_worktree_card(
     seen, spawn = _recorded_spawns()
 
     with kbc.connect() as conn:
-        tid = kb.create_task(
-            conn, title="worktree, no repo", assignee="alice", workspace_kind="worktree",
-        )
+        tid = _legacy_card(conn, "worktree, no repo", workspace_kind="worktree")
         blocked = False
         for _ in range(kbd.DEFAULT_FAILURE_LIMIT + 1):
             res = kbd.dispatch_once(conn, spawn_fn=spawn)
@@ -149,9 +162,8 @@ def test_dir_card_inside_a_repo_checkout_is_refused(
     seen, spawn = _recorded_spawns()
 
     with kbc.connect() as conn:
-        tid = kb.create_task(
-            conn, title="dir inside a repo", assignee="alice",
-            workspace_kind="dir", workspace_path=str(repo),
+        tid = _legacy_card(
+            conn, "dir inside a repo", workspace_kind="dir", workspace_path=str(repo),
         )
         res = kbd.dispatch_once(conn, spawn_fn=spawn)
 
