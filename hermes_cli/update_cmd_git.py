@@ -613,6 +613,26 @@ def _portable_git_candidates() -> list:
     return candidates
 
 
+def _git_exec_path_candidates() -> list:
+    """Ask the git on PATH where its own git-core lives: ``git --exec-path`` prints
+    ``<prefix>/libexec/git-core`` (Git for Windows: ``.../mingw64/libexec/git-core``), which is
+    exactly where the real binary sits.
+
+    This covers installs that are not under ``Program Files`` — the portable/PM-managed tree a
+    GitHub-hosted Windows runner uses (``<runner_temp>/setup-pm/tools/git-*/cmd/git.exe``) — where
+    the Program Files probes find nothing and the update would otherwise give up on the trampoline.
+    """
+    out = []
+    with suppress(Exception):
+        probe = subprocess.run(["git", "--exec-path"], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", creationflags=windows_hide_flags(), timeout=15, check=False)
+        if probe.returncode == 0 and probe.stdout.strip():
+            candidate = Path(probe.stdout.strip()) / "git.exe"
+            if candidate.exists():
+                out.append(candidate)
+    return out
+
+
 def _locate_real_git() -> Optional[Path]:
     """Find a real Git-for-Windows ``git-core/git.exe`` (standard locations + managed PortableGit) that runs
     without the trampoline guard. None when nothing suits — callers keep the broken command and let the
@@ -626,7 +646,7 @@ def _locate_real_git() -> Optional[Path]:
         Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
         for base in (r"C:\Program Files", r"C:\Program Files (x86)")
         for arch in ("clangarm64", "mingw64", "mingw32")
-    ] + _portable_git_candidates()
+    ] + _git_exec_path_candidates() + _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 

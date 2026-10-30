@@ -599,7 +599,8 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
     assert status == "503", out
     assert float(elapsed) < budget_s + 2, out
     detail = " ".join(detail)
-    assert "nothing was changed" in detail
+    # `out` carries the browse's own stderr, which names the engine error behind a generic 503.
+    assert "nothing was changed" in detail, out
     assert "`hermes -p scribe sessions repair`" in detail and "gateway" not in detail.lower()
     assert _file_state(path) == before
     assert "last_read_at" not in _session_columns(path)

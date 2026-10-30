@@ -126,6 +126,7 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    max_in_progress_reached: Optional[int] = None  # Host-wide cap reached this tick.
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1620,11 +1621,8 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    # ``last_failure_error`` is retained across handoffs.  A successful
-    # review/completion therefore supersedes an older quota/auth stamp; only
-    # the failure that most recently ended the card may trip this guard.
-    success_outcomes = {"review_requested", "completed"}
-    if (err and latest_outcome not in {"crashed", *success_outcomes}
+    # A successful review/completion supersedes an older quota/auth stamp.
+    if (err and latest_outcome not in {"crashed", "review_requested", "completed"}
             and _RESPAWN_BLOCKER_RE.search(err)):
         return "blocker_auth"
 
@@ -1885,9 +1883,7 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     memory-derived default. All config-parsing callers route through this so
     both paths agree.
     """
-    if configured is not None:
-        return configured
-    return derive_default_max_in_progress()
+    return configured if configured is not None else derive_default_max_in_progress()
 
 
 def configured_max_in_progress() -> Optional[int]:
@@ -2271,6 +2267,7 @@ def _tick_spawn_budget(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.max_in_progress_reached = total_running
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

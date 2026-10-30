@@ -234,8 +234,12 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
                                  isolation_level=None)) as conn:
         _reapply_durability_barriers(conn)
         budget.arm(conn)
-        conn.execute('BEGIN IMMEDIATE')
+        budget.check()  # opening and re-arming may already have spent the budget
+        # BEGIN is inside the guard: the progress handler can interrupt it too (the budget may have
+        # run out during the slowed open/barrier work), and an 'interrupted' raised here would
+        # otherwise escape as a generic "unavailable or corrupt" 503 instead of the drift refusal.
         try:
+            conn.execute('BEGIN IMMEDIATE')
             cursor = conn.cursor()
             apply_declared_schema(cursor)
             # Postcondition, still inside the transaction: every declared table/column resolves.

@@ -396,6 +396,9 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
         if isinstance(exc, sqlite3.OperationalError) and is_transient_sqlite_error(exc):
             detail = "Session store is busy (disk I/O or lock). Retry; the list was not cleared."
         else:
+            # The 503 below is generic; log what actually failed so an unexpected engine error is
+            # diagnosable instead of arriving as "unavailable or corrupt".
+            _log.warning("session store at %s could not be opened: %r", db_path, exc)
             detail = (
                 "Session store schema is unavailable or corrupt. Start or restart this profile's "
                 "gateway to reconcile it; if it persists, run `hermes doctor` for diagnosis. "
