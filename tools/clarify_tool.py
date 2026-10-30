@@ -118,7 +118,16 @@ def clarify_tool(questions, callback: Optional[Callable] = None) -> str:
         return tool_error(_UNAVAILABLE)
     from tools.human_input_hooks import human_input_request
     # Observers see the questions only; the answers stay in the tool result.
-    with human_input_request("clarify", prompt="\n".join(q["question"] for q in normalized)) as human:
+    # `questions=` is NOT optional for the panel: a `prompt` alone is the questions
+    # joined into one string, so the choices never leave this process and a
+    # multi-choice ask arrives on the glass with no rows to tap - answerable only as
+    # a bare yes, which is what made every clarify close with answer=None. The panel
+    # hook reads `extra["questions"][*]["choices_offered"]` and draws one row per
+    # choice; a single question's choices become the rows, and more than one question
+    # has no single set of rows so it stays a yes/skip. See
+    # panel/hooks/human-input-to-panel.py `options_from`.
+    with human_input_request("clarify", prompt="\n".join(q["question"] for q in normalized),
+                             questions=normalized) as human:
         try:
             reply = callback(normalized)
             human.outcome = str(reply.get("outcome") or "")
