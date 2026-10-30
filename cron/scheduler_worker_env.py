@@ -34,6 +34,25 @@ def _installed_purelib() -> Path | None:
         return None
 
 
+def _dependency_checkout_root(repo_root: Path) -> Path:
+    """Return the primary checkout for a linked Git worktree."""
+    root = Path(repo_root).resolve()
+    dot_git = root / ".git"
+    if not dot_git.is_file():
+        return root
+    try:
+        prefix, value = dot_git.read_text(encoding="utf-8-sig").strip().split(":", 1)
+        gitdir = Path(value.strip())
+        if not gitdir.is_absolute():
+            gitdir = dot_git.parent / gitdir
+    except (OSError, ValueError):
+        return root
+    if (prefix.strip().lower() != "gitdir" or gitdir.parent.name != "worktrees"
+            or gitdir.parent.parent.name != ".git"):
+        return root
+    return gitdir.parent.parent.parent
+
+
 def _committed_dependency_site_packages(project_root: Path) -> Path | None:
     """The dependency ``site-packages`` PM committed for this install, or ``None``.
 
@@ -47,7 +66,7 @@ def _committed_dependency_site_packages(project_root: Path) -> Path | None:
     try:
         from pm.environments import committed_venv, site_packages
 
-        environment = committed_venv(project_root)
+        environment = committed_venv(_dependency_checkout_root(project_root))
     except Exception as exc:
         # An unreadable record: pin the tree only. The cron worker's own boot re-reads it and
         # fails the dispatch with PM's error.
@@ -75,6 +94,7 @@ def pin_hermes_tree_on_pythonpath(worker_env: dict, repo_root: Path) -> dict:
     and leases the committed generation before any third-party import, and exits the worker
     if it cannot.
     """
+    repo_root = _dependency_checkout_root(repo_root)
     root = str(repo_root)
     if _installed_purelib() == Path(root).resolve():
         return worker_env

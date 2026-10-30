@@ -743,6 +743,28 @@ def test_pin_restores_the_committed_generation_site_packages(tmp_path):
     }
 
 
+def test_pin_uses_primary_checkout_generation_for_linked_worktree(tmp_path):
+    """A worktree worker must inherit the primary checkout's committed generation."""
+    import cron.scheduler_worker_env as worker_env_mod
+    import pm.environments
+
+    primary = tmp_path / "hermes-agent"
+    worktree = tmp_path / "worktree"
+    primary.mkdir()
+    worktree.mkdir()
+    gitdir = primary / ".git" / "worktrees" / "task"
+    gitdir.mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+
+    venv = _commit_generation(primary, "primary", with_site_packages=True)
+    selected = pm.environments.site_packages(venv)
+
+    env = worker_env_mod.pin_hermes_tree_on_pythonpath({}, worktree)
+    assert env["PYTHONPATH"].split(os.pathsep) == [
+        str(primary), str(selected),
+    ]
+
+
 _BOOT_ORDER_PROBE = """
 import json, os, sys
 import pm.environments
