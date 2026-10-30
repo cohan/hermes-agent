@@ -2205,6 +2205,19 @@ def _dispatch_lane_task(
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
+            if claimed.workspace_kind == "dir" and claimed.workspace_path:
+                # A dir task inside a normal checkout is the old collision
+                # hazard. Existing linked worktree checkouts are already
+                # isolated and remain valid; the main repo (or a path inside
+                # it) must be represented as workspace_kind=worktree instead.
+                requested = Path(claimed.workspace_path).expanduser()
+                if requested.exists() and not _kbw._is_linked_worktree_checkout(requested):
+                    repo_root = _kbw._git_toplevel(requested)
+                    if repo_root is not None:
+                        raise ValueError(
+                            f"repo-backed task {claimed.id} uses dir workspace {requested}; "
+                            "create it as workspace_kind=worktree with a project"
+                        )
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",

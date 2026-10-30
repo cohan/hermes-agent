@@ -26,6 +26,24 @@ if TYPE_CHECKING:
 _REMOVABLE_KINDS = ("scratch", "worktree")
 
 
+class WorktreeUnavailable(ValueError):
+    """A ``worktree`` task has no git repo to branch from.
+
+    This is a real workspace contract failure. The dispatcher records it and
+    requeues/blocks the card; it must not silently downgrade the task to a
+    shared directory or scratch workspace.
+    """
+
+    def __init__(self, task_id: str, path: str) -> None:
+        self.task_id = task_id
+        self.path = path
+        super().__init__(
+            f"task {task_id} worktree path {path!r} is not inside a git repo "
+            "and does not point at a git repo root"
+        )
+
+
+
 def _path_key(path: Path | str | None) -> str:
     """Unicode-form-insensitive identity for a filesystem path.
 
