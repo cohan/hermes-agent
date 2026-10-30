@@ -23,6 +23,14 @@ logger = logging.getLogger("run_agent")
 # ``tool_reason`` for a lost session turn lease: attributes the stop to the lease, not the user (#112647).
 _REASON_LEASE_LOST = "session turn lease lost"
 
+# Every diagnostic a lost / unrefreshable lease can raise. The notice is published to the originating
+# surface at abort time (``DurableTurnLease._publish_abort_notice``) and is ALSO listed in
+# ``gateway.run._CONTROL_INTERRUPT_MESSAGES``: a system abort must never be re-ingested as the user's
+# next message, which is what happened while the notice only travelled in the human-input slot.
+LEASE_ABORT_NOTICE_REFRESH_FAILED = "Session turn lease could not be refreshed; stopping to protect the transcript."
+LEASE_ABORT_NOTICE_LOST = "Session turn lease lost; stopping to protect the transcript."
+LEASE_ABORT_NOTICES = frozenset({LEASE_ABORT_NOTICE_REFRESH_FAILED, LEASE_ABORT_NOTICE_LOST})
+
 LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
 # SessionDB's default write patience: a renewal waits this long for the write lock, never past the authority.
@@ -53,6 +61,9 @@ class DurableTurnLease:
         self._lock = threading.Lock()
         self.turn_active = False
         self.interrupt_message: Optional[str] = None
+        # First-wins user-visible notice for the abort this lease raised, latched so a LATER interrupt
+        # (e.g. the terminal batch timeout, which nulls ``agent._interrupt_message``) cannot erase it.
+        self.abort_notice: Optional[str] = None
         self.watchdog = None  # TurnLivenessWatchdog when configured
         self.timer_handles: list = []  # periodic_scheduler handles, cancelled in join_threads
 
@@ -125,6 +136,41 @@ class DurableTurnLease:
         with self._lock:
             return self.turn_active
 
+    def _publish_abort_notice(self, message: str) -> None:
+        """Publish the abort notice to the originating surface ONCE, at abort time.
+
+        The notice is the turn's only signal that it was stopped by the lease rather than by the user or
+        by the model. Routing it through ``agent._interrupt_message`` alone makes delivery incidental:
+        that slot is the human-input slot, so the gateway requeues the text as the user's NEXT turn
+        (and a later interrupt can null it first). Publishing through the warning channel is immediate,
+        survives a later interrupt, and leaves the interrupt mechanics untouched.
+        Only the FIRST abort of this lease publishes: a lease aborts a turn once.
+        """
+        with self._lock:
+            first = self._latch_abort_notice_locked(message)
+        if first:
+            self._emit_abort_notice(message)
+
+    def _latch_abort_notice_locked(self, message: str) -> bool:
+        """First-wins latch on ``abort_notice``; caller holds ``_lock``. True when this call latched."""
+        if self.abort_notice is not None:
+            return False
+        self.abort_notice = message
+        return True
+
+    def _emit_abort_notice(self, message: str) -> None:
+        """Hand the latched notice to the surface's warning channel (never fatal)."""
+        emit_warning = getattr(self.agent, "_emit_warning", None)
+        if not callable(emit_warning):
+            return
+        try:
+            emit_warning(
+                "⚠️ Turn aborted: " + message
+                + " The session is free for a new turn; retry your message."
+            )
+        except Exception:
+            logger.debug("Failed to emit session turn lease abort notice", exc_info=True)
+
     def _interrupt_turn(self, message: str) -> None:
         """Lease-loss interrupts fire UNCONDITIONALLY (no generation claim): a lost lease means
         this process no longer owns the session. Only the watchdog's stalls can be spuriously stale."""
@@ -132,12 +178,16 @@ class DurableTurnLease:
             if self.stop.is_set() or not self.turn_active:
                 return
             self.interrupt_message = message
-            try:
-                self.agent.interrupt(message, hard_cancel=True, tool_reason=_REASON_LEASE_LOST)
-            except Exception:
-                self.agent._interrupt_requested = True
-                self.agent._interrupt_message = message
-                self.agent._tool_interrupt_reason = _REASON_LEASE_LOST
+            publish_notice = self._latch_abort_notice_locked(message)
+        if publish_notice:
+            # Outside ``_lock``: the surface callback is foreign code and must not run under the lease lock.
+            self._emit_abort_notice(message)
+        try:
+            self.agent.interrupt(message, hard_cancel=True, tool_reason=_REASON_LEASE_LOST)
+        except Exception:
+            self.agent._interrupt_requested = True
+            self.agent._interrupt_message = message
+            self.agent._tool_interrupt_reason = _REASON_LEASE_LOST
 
     def commit_liveness_abort(self, snapshot, message: str) -> bool:
         """Commit point for the watchdog's stall observation.
@@ -170,6 +220,9 @@ class DurableTurnLease:
             return False
         with self._lock:
             self.interrupt_message = message
+        # The watchdog's own ``_surface_committed_abort`` warning fires on its thread; latch+emit here
+        # so the lease carries the notice even if a later interrupt replaces the human-input slot.
+        self._publish_abort_notice(message)
         return True
 
     def clear_interrupt(self) -> None:

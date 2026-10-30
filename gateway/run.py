@@ -2770,11 +2770,32 @@ _CONTROL_INTERRUPT_MESSAGES = frozenset({
     _INTERRUPT_REASON_GATEWAY_RESTART.lower()})
 
 
+def _lease_abort_notice_messages() -> frozenset[str]:
+    """Normalised session-turn-lease abort diagnostics (single source: ``agent.turn_facade_lease``).
+
+    Imported lazily and defensively: this module is loaded on every surface, and a lease module that
+    cannot import must not break the gateway's message handling.
+    """
+    try:
+        from agent.turn_facade_lease import LEASE_ABORT_NOTICES
+
+        return frozenset(notice.lower() for notice in LEASE_ABORT_NOTICES)
+    except Exception:
+        logger.debug("Could not load session turn lease abort notices", exc_info=True)
+        return frozenset()
+
+
 def _is_control_interrupt_message(message: Optional[str]) -> bool:
     """Return True when an interrupt message is internal control flow."""
     if not message:
         return False
-    return " ".join(str(message).strip().split()).lower() in _CONTROL_INTERRUPT_MESSAGES
+    normalised = " ".join(str(message).strip().split()).lower()
+    if normalised in _CONTROL_INTERRUPT_MESSAGES:
+        return True
+    # A session-turn-lease abort is a SYSTEM diagnostic. It must never be re-ingested as the user's
+    # next message (that is what produced a phantom user turn carrying the lease notice): the notice
+    # is published to the surface when the abort fires, and the drain must leave the slot alone.
+    return normalised in _lease_abort_notice_messages()
 
 
 def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:

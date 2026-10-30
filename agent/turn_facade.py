@@ -162,6 +162,15 @@ class TurnFacadeMixin:
                     if lease is not None:
                         lease.stop_refresher()
             terminal = result if isinstance(result, dict) else {}
+            if lease is not None and getattr(lease, "abort_notice", None):
+                # The lease aborted this turn: the model produced no text (an interrupted turn with
+                # api_calls > 0 is deliberately silent). The notice is therefore the only thing the
+                # originating surface can be told, and it must not depend on the gateway requeueing
+                # the human-input slot as a fake next user turn. Put it on the turn result so the
+                # normal reply path publishes it, and keep it under its own key for consumers.
+                if not terminal.get("final_response"):
+                    terminal["final_response"] = lease.abort_notice
+                terminal["lease_abort_notice"] = lease.abort_notice
             relay_outcome = (
                 "cancelled" if terminal.get("interrupted") is True
                 else "failed" if terminal.get("failed") is True
