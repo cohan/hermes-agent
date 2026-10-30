@@ -442,7 +442,7 @@ def _collect_github(ref: dict, profile_home: str | None) -> dict:
     receipt = _receipt(ref["url"])
     receipt["forge"] = "github"
     owner, name = repo.split("/")
-    query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
+    query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state mergedAt mergeCommit{{oid}}\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
     repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
     if repository is None:
         # A private repo the login cannot read resolves to null, not an error.
@@ -452,6 +452,13 @@ def _collect_github(ref: dict, profile_home: str | None) -> dict:
     receipt["head_sha"] = sha
     if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
         raise ValueError("PR is closed or current head is unavailable")
+    if pr["state"] == "MERGED":
+        merge_commit = (pr.get("mergeCommit") or {}).get("oid")
+        if not _SHA.fullmatch(merge_commit or "") or not pr.get("mergedAt"):
+            raise ValueError("Merged PR evidence is incomplete")
+        receipt.update(ok=True, classification="success", merge_commit=merge_commit,
+                       merged_at=pr["mergedAt"], detail="PR is merged; terminal forge evidence.")
+        return receipt
     protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
     required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
     # Visibility is already proven above, so a 403/404 here is this plan refusing the

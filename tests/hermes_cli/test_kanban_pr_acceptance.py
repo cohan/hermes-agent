@@ -230,3 +230,59 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+def test_merged_pr_accepts_before_plan_gated_branch_rules(monkeypatch):
+    """A merged PR is terminal forge evidence even when private-repo branch rules are unavailable."""
+    from hermes_cli import kanban_pr_acceptance as kpa
+
+    sha = "a" * 40
+    merge_commit = "b" * 40
+
+    def api(endpoint, **_kwargs):
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": sha,
+                "baseRefName": "main",
+                "state": "MERGED",
+                "mergedAt": "2026-10-29T11:48:53Z",
+                "mergeCommit": {"oid": merge_commit},
+                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": []}},
+            }}}}
+        if "/rules/branches/" in endpoint:
+            raise kpa._ForgeCapabilityError("private free-plan branch rules unavailable")
+        raise AssertionError(f"unexpected GitHub API read: {endpoint}")
+
+    monkeypatch.setattr(kpa, "_api", api)
+
+    receipt = kpa.collect_acceptance(
+        "acme/repo", "https://github.com/acme/repo/pull/7")
+
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "success"
+    assert receipt["merge_commit"] == merge_commit
+
+
+def test_open_pr_still_reports_plan_gated_branch_rules(monkeypatch):
+    """Open PRs must not bypass unavailable branch-rule evidence."""
+    from hermes_cli import kanban_pr_acceptance as kpa
+
+    def api(endpoint, **_kwargs):
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": "a" * 40,
+                "baseRefName": "main",
+                "state": "OPEN",
+                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": []}},
+            }}}}
+        if "/rules/branches/" in endpoint:
+            raise kpa._ForgeCapabilityError("private free-plan branch rules unavailable")
+        raise AssertionError(f"unexpected GitHub API read: {endpoint}")
+
+    monkeypatch.setattr(kpa, "_api", api)
+
+    receipt = kpa.collect_acceptance(
+        "acme/repo", "https://github.com/acme/repo/pull/7")
+
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "forge"
