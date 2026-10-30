@@ -2221,6 +2221,17 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             await GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)
+            if getattr(self, "_lifecycle_exit_tracking", False) and not getattr(self, "_startup_cleanup_only", False):
+                # Stamp before the post-teardown tail (control socket/MCP cleanup) and before asyncio.run()
+                # joins the loop's default executor. A later SIGKILL is then not mistaken for a pre-teardown death.
+                from gateway.lifecycle_ledger import mark_exited
+                exit_code = self._exit_code
+                if exit_code is None:
+                    exit_code = 1 if (
+                        getattr(self, "_signal_initiated_shutdown", False)
+                        and not self._restart_requested
+                    ) or self.should_exit_with_failure else 0
+                mark_exited(exit_code, reason="graceful_shutdown")
         finally:
             _watchdog_done.set()
 

@@ -5126,6 +5126,34 @@ def _guard_corrupt_user_config() -> None:
         raise SystemExit(2) from exc
 
 
+def _abandon_default_executor(loop) -> None:
+    """Stop asyncio's default executor without joining its worker threads."""
+    executor = getattr(loop, "_default_executor", None)
+    if executor is None:
+        return
+    loop._executor_shutdown_called = True
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        executor.shutdown(wait=False)
+    loop._default_executor = None
+
+
+def _run_gateway(coro):
+    """Run the gateway without asyncio.run()'s unbounded executor join."""
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        # asyncio.run() joins every default-executor thread without a deadline. Gateway teardown has
+        # already stamped the lifecycle sentinel, so abandon a wedged worker after a short leash and
+        # let the process-level os._exit backstop finish without Py_FinalizeEx joining it again.
+        _abandon_default_executor(loop)
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
 def main():
     """CLI entry point for the gateway."""
     # Before any config-dependent startup (watchdog, DB opens, provider resolution).
@@ -5205,7 +5233,7 @@ def main():
         # planned-restart, and service-restart paths, all of which complete teardown first. Routing those
         # codes through the same os._exit backstop means EVERY exit path is wedge-proof, not just the
         # boolean-return ones.
-        success = asyncio.run(start_gateway(config))
+        success = _run_gateway(start_gateway(config))
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).

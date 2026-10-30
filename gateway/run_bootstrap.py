@@ -880,6 +880,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             start_nous_auth_keepalive()
 
         _unclean_exit = _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
+        # The normal stop path stamps the sentinel immediately after runner-owned teardown. Early
+        # startup cleanup remains unclean until the process-level fallback in gateway.run.main().
+        setattr(runner, "_lifecycle_exit_tracking", True)
         _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
         _ensure_windows_gateway_venv_imports()
 

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
+import json
 
 import pytest
 
@@ -14,6 +15,48 @@ class _ExitCalled(Exception):
 
 def _raise_exit(code: int) -> None:
     raise _ExitCalled(code)
+
+
+def test_run_gateway_stamps_before_abandoning_blocked_executor(monkeypatch, tmp_path):
+    """A completed teardown remains clean even when the post-teardown executor is wedged."""
+    import asyncio
+    import concurrent.futures
+    import threading
+
+    from gateway.lifecycle_ledger import get_lifecycle_sentinel_path, record_startup, mark_exited
+
+    record_startup(home=tmp_path)
+    blocker = threading.Event()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    async def completed_teardown():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(executor)
+        mark_exited(0, reason="graceful_shutdown", home=tmp_path)
+        loop.run_in_executor(None, blocker.wait)
+        return True
+
+    assert gateway_run._run_gateway(completed_teardown()) is True
+    assert json.loads(get_lifecycle_sentinel_path(tmp_path).read_text())["phase"] == "exited"
+    blocker.set()
+    executor.shutdown(wait=True)
+
+
+def test_abandon_default_executor_does_not_join(monkeypatch):
+    """The process-exit tail abandons, rather than joins, the loop executor."""
+    class Executor:
+        _shutdown = False
+
+        def shutdown(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Loop:
+        _default_executor = Executor()
+        _executor_shutdown_called = False
+
+    gateway_run._abandon_default_executor(Loop)
+    assert Loop._executor_shutdown_called is True
+    assert Loop._default_executor is None
 
 
 def test_main_terminates_via_os_exit_not_systemexit(monkeypatch):
