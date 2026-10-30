@@ -304,6 +304,79 @@ class TestScanSkillCommands:
 
     # -- core-command collision guard (#31204 / #53450) ---------------------
 
+    def test_core_command_collision_is_reported_once_per_process(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """Rescans for other identities must not re-log the same collision.
+
+        The scan is memoized per ``(platform, home, project)`` and one boot sweeps
+        several identities (the TUI gateway polls per platform/profile), so the
+        per-scan ``seen_names`` guard re-emitted the same skill's note once per
+        identity — the repeated ``/handoff`` line in the boot log. One line, once
+        per process, and the skill still does not claim the core command.
+        """
+        import logging as _logging
+        import os
+
+        import agent.skill_commands as sc_mod
+
+        # `help` is a core command, so a skill by that name may never auto-register.
+        _make_skill(tmp_path, "help")
+
+        monkeypatch.setattr(
+            sc_mod, "_reported_skill_command_collisions", set(), raising=False
+        )
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch.object(sc_mod, "_skill_commands_by_key", {}),
+            caplog.at_level(_logging.WARNING, logger="agent.skill_commands"),
+        ):
+            for platform in ("", "telegram", "discord"):
+                with patch.dict(os.environ, {"HERMES_PLATFORM": platform}):
+                    result = sc_mod.scan_skill_commands()
+                    assert "/help" not in result
+
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "auto-registration" in r.getMessage().lower()
+        ]
+        assert len(lines) == 1, lines
+        assert "help -> /help" in lines[0]
+
+    def test_collision_line_counts_every_skill_in_one_scan(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """One scan reports its collisions in a single counted line."""
+        import logging as _logging
+
+        import agent.skill_commands as sc_mod
+
+        _make_skill(tmp_path, "help")
+        _make_skill(tmp_path, "status")
+
+        monkeypatch.setattr(
+            sc_mod, "_reported_skill_command_collisions", set(), raising=False
+        )
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch.object(sc_mod, "_skill_commands_by_key", {}),
+            caplog.at_level(_logging.WARNING, logger="agent.skill_commands"),
+        ):
+            result = sc_mod.scan_skill_commands()
+
+        assert "/help" not in result and "/status" not in result
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "auto-registration" in r.getMessage().lower()
+        ]
+        assert len(lines) == 1, lines
+        assert "2 skill slash command(s)" in lines[0]
+        assert "help -> /help" in lines[0] and "status -> /status" in lines[0]
+
 
     # -- inter-skill slug collision dedup (#50304 / #63305) ------------------
 

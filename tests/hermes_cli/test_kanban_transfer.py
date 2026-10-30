@@ -67,10 +67,17 @@ def _seed_board(slug: str = "alpha") -> dict[str, str]:
         ids["scratch"] = kb.create_task(
             conn, title="scratch task", body="body", assignee="coder"
         )
+        # A card exported from ANOTHER machine: its worktree path does not
+        # exist here, and creation now refuses a repo-less worktree (see
+        # test_kanban_workspace_contract.py), so forge the row instead.
         ids["worktree"] = kb.create_task(
-            conn, title="worktree task", assignee="coder",
-            workspace_kind="worktree", workspace_path="/exporter/repo",
+            conn, title="worktree task", assignee="coder"
         )
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'worktree', workspace_path = ? WHERE id = ?",
+            ("/exporter/repo", ids["worktree"]),
+        )
+        conn.commit()
         kb.add_comment(conn, ids["scratch"], "brooklyn", "a comment")
         kb.link_tasks(conn, ids["scratch"], ids["worktree"])
         kb.store_attachment_bytes(
