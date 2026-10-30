@@ -483,6 +483,59 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/example/repo/pull/123",
+        "http://github.com/example/repo/pull/123",
+        "https://git.coio.uk/grp/proj/-/merge_requests/7",
+        "https://git.coio.uk/grp/sub/proj/-/merge_requests/12",
+    ],
+)
+def test_active_pr_guard_arms_on_a_merge_request_url_too(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    """A GitLab MR link arms the same duplicate-work guard as a GitHub PR link.
+
+    The guard is forge-aware: a card waiting on
+    ``git.coio.uk/.../-/merge_requests/N`` is held exactly like one waiting on
+    ``github.com/.../pull/N``, so the GitHub->GitLab migration does not silently
+    drop the protection for the repos that moved.  Nested GitLab groups count.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="awaiting the request", assignee="worker")
+        kb.add_comment(conn, tid, author="worker", body=f"Opened {url} for review.")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid not in [s[0] for s in res.spawned]
+        assert dict(res.respawn_guarded).get(tid) == "active_pr"
+
+
+def test_active_pr_guard_ignores_a_url_that_is_not_a_request(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Widening the guard must not arm on a plain repo/branch link."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="just a link", assignee="worker")
+        kb.add_comment(
+            conn, tid, author="worker",
+            body="Pushed to https://git.coio.uk/grp/proj/-/tree/main and "
+                 "https://github.com/example/repo/pull/ not a request.",
+        )
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
 def _backdate_comments(conn, tid, seconds=60):
     """Second-granularity timestamps: make the PR comment older than the
     handoff that follows it in the same test."""

@@ -47,15 +47,31 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-_GITHUB_PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
-# Backwards-compatible alias: the GitHub PR URL pattern other modules import.
-_PR = _GITHUB_PR
-_GITLAB_PROJECT = r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
-_GITLAB_MR = re.compile(r"https://(git\.coio\.uk)/(" + _GITLAB_PROJECT + r")/-/merge_requests/([1-9][0-9]*)")
-_HAS_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
-_SHA = re.compile(r"[0-9a-f]{40}")
 
 GITLAB_HOSTS = ("git.coio.uk",)
+
+# Pull/merge-request path shapes, scheme excluded.  The contract regexes below
+# and ``FORGE_REQUEST_URL_RE`` (the free-text scan the respawn guard arms on)
+# are all built from these, so the two paths cannot drift apart: a shape
+# acceptance refuses cannot arm the guard, and one it accepts always does.
+_GITHUB_PR_PATH = r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)"
+_GITLAB_PROJECT = r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
+_GITLAB_MR_PATH = ("(" + "|".join(re.escape(h) for h in GITLAB_HOSTS) + ")/("
+                   + _GITLAB_PROJECT + r")/-/merge_requests/([1-9][0-9]*)")
+
+_GITHUB_PR = re.compile(r"https://" + _GITHUB_PR_PATH)
+# Backwards-compatible alias: the GitHub PR URL pattern other modules import.
+_PR = _GITHUB_PR
+_GITLAB_MR = re.compile(r"https://" + _GITLAB_MR_PATH)
+#: A pull/merge-request URL anywhere in free text (a worker's comment).  The
+#: respawn guard arms on this: while one is open, re-spawning the card risks a
+#: duplicate pull/merge request.  The scheme is relaxed to ``https?`` — a
+#: comment that spells an ``http://`` link still names the open request.
+FORGE_REQUEST_URL_RE = re.compile(
+    r"https?://(?:" + _GITHUB_PR_PATH + "|" + _GITLAB_MR_PATH + ")", re.IGNORECASE)
+
+_HAS_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+_SHA = re.compile(r"[0-9a-f]{40}")
 #: Label a reviewer applies to a merge request to accept it (the GitLab CE gate).
 GITLAB_REVIEW_LABEL = "kanban-accepted"
 _GITLAB_API = "https://{host}/api/v4/"
