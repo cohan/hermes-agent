@@ -66,6 +66,12 @@ class Board:
     def __post_init__(self) -> None:
         self.home = self.root / "home"
         self.hermes_home = self.home / ".hermes"
+        # Hard guard: a board this harness builds may never be the operator's live board. The
+        # conftest in this directory guards the process env; this guards the harness itself, where
+        # the bug actually bites (one Board(root=<real>) and the loop below writes probe cards to
+        # ~/.hermes/kanban.db).
+        from tests.e2e.core.kanban.conftest import assert_board_isolated
+        assert_board_isolated(self.hermes_home / "kanban.db", what="Board harness")
         self.hermes_home.mkdir(parents=True, exist_ok=True)
         (self.hermes_home / "config.yaml").write_text(
             "model:\n"
