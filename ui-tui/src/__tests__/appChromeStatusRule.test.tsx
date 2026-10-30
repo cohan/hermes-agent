@@ -140,7 +140,7 @@ describe('StatusRule session title', () => {
     }
   })
 
-  it('pins the named session at the far-right edge instead of the cwd label', () => {
+  it('puts the named session in the left slot and leaves the cwd on the right edge', () => {
     const element = StatusRule({
       ...baseProps,
       sessionTitle: 'weekly-digest'
@@ -150,7 +150,8 @@ describe('StatusRule session title', () => {
     const title = findElementWithText(element, 'weekly-digest')
 
     expect(rendered).toContain('weekly-digest')
-    expect(rendered).not.toContain('~/repo')
+    // The swap moves the title left; the right edge goes back to the cwd.
+    expect(rendered).toContain('~/repo')
     // Regression for issue #82465: a raw, full-saturation accent-hue
     // background (e.g. #FFBF00 on DARK_SEEDS) paired with statusFg (a
     // near-white tone never designed to sit on it) rendered at roughly a
@@ -161,6 +162,10 @@ describe('StatusRule session title', () => {
     expect(title?.props.backgroundColor).toBeUndefined()
     expect(title?.props.color).toBe(DEFAULT_THEME.color.accent)
   })
+
+  // Which side the busy ticker lands on cannot be asserted from the element
+  // tree (FaceTicker is a component, so `textContent` never runs it) — the
+  // mounted render in appChromeTitleSwap.test.tsx owns that.
 })
 
 describe('StatusRule background-subagent indicator', () => {

@@ -16,11 +16,9 @@ import { fmtDuration } from '../domain/messages.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
 import { messages, t as tr } from '../i18n/runtime.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
-import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.js'
+import { useViewportSnapshot } from '../lib/viewportStore.js'
 import type { Theme } from '../theme.js'
 import type { Msg } from '../types.js'
-
-import { scrollbarColors } from './overlayPrimitives.js'
 
 const FACE_TICK_MS = 2500
 const HEART_COLORS = ['#ff5fa2', '#ff4d6d']
@@ -613,15 +611,29 @@ export function StatusRule({
       ? noticeReserve
       : stringWidth(status)
 
+  // Left/right slot swap: a named session puts its title in the LEFT slot (where
+  // the busy ticker and the idle status text normally sit), and while it works
+  // the busy ticker moves out to the right edge in the title's old place.  A
+  // session with no title (or a `title`-less status_bar.fields filter) keeps the
+  // upstream layout exactly — ticker left, cwd right.
+  const showTitleSlot = !!sessionTitle && ok('title')
+  const titleLabel = showTitleSlot ? ` ${sessionTitle} ` : ''
+  const tickerWidth = busy ? busyIndicatorWidth(indicatorStyle, turnStartedAt != null) : 0
+  const swapTicker = showTitleSlot && busy
+  const leftSlotWidth = showTitleSlot ? stringWidth(titleLabel) : slotWidth
+
   const essentialWidth =
     stringWidth('─ ') +
     batteryWidth +
-    slotWidth +
+    leftSlotWidth +
     stringWidth(' │ ') +
     stringWidth(modelText) +
     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
 
-  const rightLabel = sessionTitle && ok('title') ? ` ${sessionTitle} ` : cwdLabel
+  // The right edge is the shrinkable side and `statusRuleWidths` only measures
+  // the string it is handed, so a swapped-in ticker reserves its layout width
+  // through a spacer while the live ticker itself renders in the slot below.
+  const rightLabel = swapTicker ? ' '.repeat(tickerWidth) : cwdLabel
   const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, rightLabel, essentialWidth)
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
@@ -734,7 +746,11 @@ export function StatusRule({
               <Text color={t.color.muted}>{' │ '}</Text>
             </Text>
           ) : null}
-          {busy ? (
+          {showTitleSlot ? (
+            <Text bold color={t.color.accent} wrap="truncate-end">
+              {titleLabel}
+            </Text>
+          ) : busy ? (
             <FaceTicker
               color={statusColor}
               startedAt={turnStartedAt}
@@ -880,10 +896,19 @@ export function StatusRule({
       {rightWidth > 0 ? (
         <>
           <Text color={t.color.border}>{separatorWidth >= 3 ? ' ─ ' : ' '}</Text>
-          <Box flexShrink={0} width={rightWidth}>
-            <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
-              {rightLabel}
-            </Text>
+          <Box flexDirection="row" flexShrink={0} overflow="hidden" width={rightWidth}>
+            {swapTicker ? (
+              <FaceTicker
+                color={statusColor}
+                startedAt={turnStartedAt}
+                style={indicatorStyle}
+                verbOverride={compacting ? T.status.compacting : undefined}
+              />
+            ) : (
+              <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
+                {rightLabel}
+              </Text>
+            )}
           </Box>
         </>
       ) : null}
@@ -917,72 +942,17 @@ export function StickyPromptTracker({ messages, offsets, scrollRef, onChange }: 
 }
 
 export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) {
-  const [hover, setHover] = useState(false)
-  const [grab, setGrab] = useState<number | null>(null)
-  const grabRef = useRef<number | null>(null)
-  const { scrollHeight: total, top: pos, viewportHeight: vp } = useScrollbarSnapshot(scrollRef)
+  // #no-transcript-scrollbar (local patch): the thumb/track glyphs (│ ┃) lived
+  // in the transcript's right-hand column, so a terminal-native drag-select
+  // over more than one line copied a column of box-drawing characters into
+  // whatever was pasted. Nothing is drawn here any more; the width={1} gutter
+  // is still reserved so the transcript never reflows when it outgrows the
+  // viewport, and wheel / keyboard scrolling are untouched. The cost is the
+  // click-drag-to-scroll affordance, which goes with the bar.
+  void scrollRef
+  void t
 
-  if (!vp) {
-    return <Box width={1} />
-  }
-
-  const s = scrollRef.current
-  const scrollable = total > vp
-  const thumb = scrollable ? Math.max(1, Math.round((vp * vp) / total)) : vp
-  const travel = Math.max(1, vp - thumb)
-  const thumbTop = scrollable ? Math.round((pos / Math.max(1, total - vp)) * travel) : 0
-  const { thumb: thumbColor, track: trackColor } = scrollbarColors(t, hover, grab !== null)
-
-  const jump = (row: number, offset: number) => {
-    if (!s || !scrollable) {
-      return
-    }
-
-    s.scrollTo(Math.round((Math.max(0, Math.min(travel, row - offset)) / travel) * Math.max(0, total - vp)))
-  }
-
-  return (
-    <Box
-      flexDirection="column"
-      onMouseDown={(e: { localRow?: number }) => {
-        const row = Math.max(0, Math.min(vp - 1, e.localRow ?? 0))
-        const off = row >= thumbTop && row < thumbTop + thumb ? row - thumbTop : Math.floor(thumb / 2)
-
-        grabRef.current = off
-        setGrab(off)
-        jump(row, off)
-      }}
-      onMouseDrag={(e: { localRow?: number }) =>
-        jump(Math.max(0, Math.min(vp - 1, e.localRow ?? 0)), grabRef.current ?? Math.floor(thumb / 2))
-      }
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      onMouseUp={() => {
-        grabRef.current = null
-        setGrab(null)
-      }}
-      width={1}
-    >
-      {/* Nothing to scroll → draw nothing (the width={1} Box still reserves
-          the column). Drawn-blank cells composite to a black bar on
-          transparent terminals — same class as the removed opaque fills. */}
-      {!scrollable ? null : (
-        <>
-          {thumbTop > 0 ? (
-            <Text color={trackColor}>{`${'│\n'.repeat(Math.max(0, thumbTop - 1))}${thumbTop > 0 ? '│' : ''}`}</Text>
-          ) : null}
-          {thumb > 0 ? (
-            <Text color={thumbColor}>{`${'┃\n'.repeat(Math.max(0, thumb - 1))}${thumb > 0 ? '┃' : ''}`}</Text>
-          ) : null}
-          {vp - thumbTop - thumb > 0 ? (
-            <Text
-              color={trackColor}
-            >{`${'│\n'.repeat(Math.max(0, vp - thumbTop - thumb - 1))}${vp - thumbTop - thumb > 0 ? '│' : ''}`}</Text>
-          ) : null}
-        </>
-      )}
-    </Box>
-  )
+  return <Box width={1} />
 }
 
 interface StatusRuleProps {

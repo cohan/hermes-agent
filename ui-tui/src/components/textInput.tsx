@@ -47,7 +47,6 @@ const FWD_DEL_RE = new RegExp(`${ESC}\\[3(?:[~$^]|;)`)
 const PRINTABLE = /^[ -~\u00a0-\uffff]+$/
 const BRACKET_PASTE = new RegExp(`${ESC}?\\[20[01]~`, 'g')
 const FRAME_BATCH_MS = 16
-const MULTI_CLICK_MS = 500
 type MinimalEnv = Record<string, string | undefined>
 
 const invert = (s: string) => INV + s + INV_OFF
@@ -824,8 +823,6 @@ export function TextInput({
   const inkRepaintedRef = useRef(false)
   const inkRepaintResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lineWidthRef = useRef(stringWidth(value.includes('\n') ? value.slice(value.lastIndexOf('\n') + 1) : value))
-  const mouseAnchorRef = useRef<null | number>(null)
-  const lastClickRef = useRef<{ at: number; offset: number }>({ at: 0, offset: -1 })
   const undo = useRef<{ cursor: number; value: string }[]>([])
   const redo = useRef<{ cursor: number; value: string }[]>([])
 
@@ -1317,64 +1314,33 @@ export function TextInput({
     commit(nextValue, nextCursor)
   }
 
-  const startMouseSelection = (next: number) => {
-    const c = snapPos(vRef.current, next)
-
-    mouseAnchorRef.current = c
-    selRef.current = { end: c, start: c }
-    setSel(null)
-    setCur(c)
-    curRef.current = c
-  }
-
-  const dragMouseSelection = (next: number) => {
-    if (mouseAnchorRef.current === null) {
-      return
-    }
-
-    const c = snapPos(vRef.current, next)
-    const range = { end: c, start: mouseAnchorRef.current }
-    selRef.current = range
-    setSel(range.start === range.end ? null : range)
-    setCur(c)
-    curRef.current = c
-  }
-
-  const endMouseSelection = () => {
-    mouseAnchorRef.current = null
-
-    const range = selRef.current
-
-    if (range && range.start === range.end) {
-      selRef.current = null
-      setSel(null)
-
-      return
-    }
-
-    const normalized = selRange()
-
-    if (isMac && normalized) {
-      void writeClipboardText(vRef.current.slice(normalized.start, normalized.end))
-    }
-  }
-
   const offsetAt = (e: { localCol?: number; localRow?: number }) =>
     offsetFromPosition(display, e.localRow ?? 0, e.localCol ?? 0, columns)
 
-  const isMultiClickAt = (offset: number) => {
-    const now = Date.now()
-    const last = lastClickRef.current
-    lastClickRef.current = { at: now, offset }
+  /**
+   * #composer-tap-caret: the one mouse gesture that moves the caret is a tap
+   * INSIDE the input box — it puts the caret where the tap landed. It only ever
+   * *places* the caret: no anchor is kept (see `mouseAnchorRef`'s removal), so
+   * a drag or a double click can never turn into a selection.
+   */
+  const placeCaretFromMouse = (next: number) => {
+    const c = snapPos(vRef.current, next)
 
-    return now - last.at < MULTI_CLICK_MS && offset === last.offset
+    clearSel()
+    setCur(c)
+    curRef.current = c
   }
 
+  // #composer-tap-caret: taps on the chrome AROUND the input box never move the
+  // caret. This API stays only because appLayout's gutter / spacer drag path
+  // funnels through it — every entry point here is inert, so a drag that starts
+  // on the prompt cell or on the spacer row above the composer leaves the caret
+  // alone, while a tap on the input box itself is handled by the Box below.
   if (mouseApiRef) {
     mouseApiRef.current = {
-      dragAt: (row, col) => dragMouseSelection(offsetFromPosition(display, row, col, columns)),
-      end: endMouseSelection,
-      startAtBeginning: () => startMouseSelection(0)
+      dragAt: () => {},
+      end: () => {},
+      startAtBeginning: () => {}
     }
   }
 
@@ -1726,16 +1692,24 @@ export function TextInput({
 
   return (
     <Box
+      // #composer-tap-caret: a tap INSIDE the input box puts the caret where
+      // the tap landed — the only mouse gesture that moves it. A drag or a
+      // double click is swallowed and otherwise ignored (no drag-select, no
+      // select-all), and every button event is stopped here so nothing
+      // underneath starts a transcript selection through the composer. The
+      // wheel is unaffected: it arrives as a ParsedKey, not a button event, so
+      // scrolling the transcript from over the composer still works. Keyboard
+      // selection inside the composer (shift+arrows, ctrl+a, ctrl+c/x) is
+      // untouched, and right-click keeps its copy/paste gesture. Taps on the
+      // chrome around the box (the prompt cell, the spacer row above) never
+      // move the caret — that path is the inert TextInputMouseApi.
       onClick={(e: MouseEventLite) => {
         if (!focus) {
           return
         }
 
         e.stopImmediatePropagation?.()
-        clearSel()
-        const next = offsetAt(e)
-        setCur(next)
-        curRef.current = next
+        placeCaretFromMouse(offsetAt(e))
       }}
       onMouseDown={(e: MouseEventLite) => {
         if (!focus) {
@@ -1763,28 +1737,19 @@ export function TextInput({
         }
 
         e.stopImmediatePropagation?.()
-        const offset = offsetAt(e)
-
-        if (isMultiClickAt(offset)) {
-          mouseAnchorRef.current = null
-          selectAll()
-
-          return
-        }
-
-        startMouseSelection(offset)
+        // A press places the caret but keeps no anchor: a drag that follows
+        // must not become a selection (#composer-tap-caret).
+        placeCaretFromMouse(offsetAt(e))
       }}
       onMouseDrag={(e: MouseEventLite) => {
-        if (!focus || e.button !== 0 || mouseAnchorRef.current === null) {
+        if (!focus || e.button !== 0) {
           return
         }
 
         e.stopImmediatePropagation?.()
-        dragMouseSelection(offsetAt(e))
       }}
       onMouseUp={(e: MouseEventLite) => {
         e.stopImmediatePropagation?.()
-        endMouseSelection()
       }}
       ref={boxRef}
       width={columns}
