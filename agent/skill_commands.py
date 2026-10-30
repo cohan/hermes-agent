@@ -476,8 +476,34 @@ def skill_command_collision_note(name: str) -> Optional[str]:
     return f"slash command /{cmd_name} unavailable — name taken by built-in; use /skill {name}"
 
 
-def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: dict[str, dict[str, Any]]) -> None:
-    """Register one SKILL.md in *commands* (no-op when filtered or colliding)."""
+# Core-command collisions already reported in this process. One boot sweeps several
+# (platform, home, project) identities and the per-scan ``seen_names`` guard re-logged the
+# same note once per identity — seven identical lines in one startup. One line per process
+# per collision; the per-skill note stays ``skill_command_collision_note``.
+_reported_skill_command_collisions: set[tuple[str, str]] = set()
+
+
+def _report_skill_command_collisions(collisions: list[tuple[str, str]]) -> None:
+    """Log one line for the collisions a scan found, once per process per collision."""
+    with _publish_lock:
+        fresh = [c for c in collisions if c not in _reported_skill_command_collisions]
+        _reported_skill_command_collisions.update(fresh)
+    if not fresh:
+        return
+    logger.warning(
+        "Skipped auto-registration for %d skill slash command(s) colliding with a core Hermes "
+        "command (load them with '/skill <name>' instead): %s",
+        len(fresh), ", ".join(f"{name} -> /{slug}" for name, slug in fresh),
+    )
+
+
+def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: dict[str, dict[str, Any]],
+                   collisions: list[tuple[str, str]]) -> None:
+    """Register one SKILL.md in *commands* (no-op when filtered or colliding).
+
+    A core-command collision is appended to *collisions* rather than logged here: the caller
+    reports a scan's collisions in one line, once per process.
+    """
     from tools.skills_tool import _parse_frontmatter, skill_matches_apps, skill_matches_platform, skill_matches_environment
     if any(part in _SCAN_SKIP_PARTS for part in skill_md.parts):
         return
@@ -499,8 +525,8 @@ def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: dic
     # A collision with a core command (name or alias) skips auto-registration; the skill stays
     # loadable via /skill <name>. The same predicate feeds the /skills + palette notes.
     if skill_command_collision_note(name) is not None:
-        logger.warning("Skill %r generates slash command '/%s' which collides with a core Hermes command; "
-                       "skipping auto-registration. Use '/skill %s' instead.", name, cmd_name, name)
+        # Reported by the caller as one deduplicated line per process.
+        collisions.append((name, cmd_name))
         return
     # Dedup on the slug too: "git_helper" and "git-helper" normalize the same.
     # First-wins preserves project > local > external precedence.
@@ -531,6 +557,7 @@ def scan_skill_commands() -> dict[str, dict[str, Any]]:
     # Taken BEFORE the scan: an install racing the scan moves it, so the next lookup rescans.
     signature = _skill_dirs_signature()
     commands: dict[str, dict[str, Any]] = {}
+    collisions: list[tuple[str, str]] = []
     try:
         from tools.skills_tool import _get_disabled_skill_names, _skill_catalog
         disabled = _get_disabled_skill_names()
@@ -541,7 +568,7 @@ def scan_skill_commands() -> dict[str, dict[str, Any]]:
         for entry in _skill_catalog():
             if entry["status"] == "unique":
                 try:
-                    _scan_skill_md(Path(entry["path"]), disabled, seen_names, commands)
+                    _scan_skill_md(Path(entry["path"]), disabled, seen_names, commands, collisions)
                 except Exception:
                     continue
     except Exception:
@@ -549,6 +576,7 @@ def scan_skill_commands() -> dict[str, dict[str, Any]]:
     # Publish the scanned map atomically: a reader must see a consistent
     # (key, map) pair. Only the publish/lookup pair is locked; the scan above
     # (file I/O, deferred imports) stays outside it (#14536, #74574).
+    _report_skill_command_collisions(collisions)
     with _publish_lock:
         # Publishing under the lock keeps the (key, map) pair consistent for any
         # reader between the lookup and this store (#14536, #74574); the scan above
