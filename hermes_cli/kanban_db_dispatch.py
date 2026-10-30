@@ -2899,6 +2899,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     if _kb._IS_WINDOWS:
         _live_worker_procs[proc.pid] = proc
     return proc.pid
+
+
 # ---------------------------------------------------------------------------
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
