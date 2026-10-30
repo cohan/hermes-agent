@@ -29,6 +29,30 @@ def test_install_runtime_selection_is_scoped_and_read_only(tmp_path, monkeypatch
     assert runtime_paths.selected_venv(first) == generation
 
 
+def test_worktree_uses_primary_checkout_committed_environment(tmp_path, monkeypatch):
+    """A linked worktree is another checkout of its primary install, not a new install."""
+    from pm import environments as runtime_paths
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    primary = tmp_path / "primary"
+    worktree = tmp_path / "worktree"
+    gitdir = primary / ".git" / "worktrees" / "task"
+    gitdir.mkdir(parents=True)
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+
+    state = runtime_paths.install_state_dir(primary)
+    environment = state / "environments" / "committed" / "venv"
+    environment.mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+    (state / "facts.json").write_text(json.dumps({"schema": 1, "packages": {
+        "venv": {"environment": str(environment)},
+    }}), encoding="utf-8")
+
+    assert runtime_paths.install_state_dir(worktree) == state
+    assert runtime_paths.selected_venv(worktree) == environment
+
+
 def test_boot_uses_one_selected_dependency_tree_in_fresh_process(tmp_path, monkeypatch):
     import os
     import subprocess
