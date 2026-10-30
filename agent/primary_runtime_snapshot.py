@@ -40,9 +40,11 @@ def _snapshot_primary_runtime(agent):
     }
     if agent.api_mode == "anthropic_messages":
         agent._primary_runtime.update({
-            "anthropic_api_key": agent._anthropic_api_key,
-            "anthropic_base_url": agent._anthropic_base_url,
-            "is_anthropic_oauth": agent._is_anthropic_oauth,
+            # getattr: the OAuth path builds the client without ever setting these on the
+            # agent, and a hard read here kills the worker instead of falling back.
+            "anthropic_api_key": getattr(agent, "_anthropic_api_key", ""),
+            "anthropic_base_url": getattr(agent, "_anthropic_base_url", agent.base_url),
+            "is_anthropic_oauth": getattr(agent, "_is_anthropic_oauth", False),
         })
 
 
@@ -77,8 +79,10 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
     }
     if api_mode == "anthropic_messages":
         rt.update({
-            "anthropic_api_key": agent._anthropic_api_key,
-            "anthropic_base_url": agent._anthropic_base_url,
-            "is_anthropic_oauth": agent._is_anthropic_oauth,
+            # getattr for the same reason as _snapshot_primary_runtime: the OAuth client path
+            # never sets these, and a hard read kills the worker.
+            "anthropic_api_key": getattr(agent, "_anthropic_api_key", ""),
+            "anthropic_base_url": getattr(agent, "_anthropic_base_url", agent.base_url),
+            "is_anthropic_oauth": getattr(agent, "_is_anthropic_oauth", False),
         })
     return rt
