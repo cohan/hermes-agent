@@ -1240,6 +1240,55 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
+# Host conditions, NOT the card's work: the attempt died before it could run
+# anything, killed by the disk or by the profile owner's drain window. Incident
+# 2026-10-26 — ENOSPC on ``/`` while the owner created a worker outbox
+# (``OSError [Errno 28]``) plus ``runtime_draining`` refusals — burned the whole
+# failure budget of t_4ac3fea8, t_17ba920b, t_437f901e, t_7c8f2747, t_d604fe9c
+# and t_cc389aeb to ``gave_up``. Matched as exact, case-sensitive substrings
+# against the dead worker's error text and ``worker_output``. The first entry is
+# the worker client's own message (``hermes_cli/kanban_worker_client.py``,
+# ``_submit_claim``); the rest come from the owner/gateway refusal and skill-load
+# paths — keep this tuple in sync with them.
+HOST_CONDITION_MARKERS: tuple[str, ...] = (
+    "Kanban execution unknown; retained by owner",
+    "Kanban owner refused: runtime_draining",
+    "No space left on device",
+    "managed_worker_failed",
+    "kanban_skills_unavailable",
+)
+
+# A host condition is not charged to the card, but it must not loop forever either:
+# past this many spared retries in a rolling hour it is booked as a normal failure.
+HOST_CONDITION_RETRY_LIMIT = 5
+HOST_CONDITION_RETRY_WINDOW_SECONDS = 3600
+
+
+def _host_condition_marker(dead: _DeadWorker) -> Optional[str]:
+    """The host-condition marker that explains this crash, or None.
+
+    Only ordinary crashes qualify: a protocol violation, quota wall or terminal
+    provider error keeps its own booking (and its own budget rules).
+    """
+    if dead.protocol_violation or dead.rate_limited or dead.terminal_provider:
+        return None
+    haystack = (dead.error_text or "", (dead.event_payload or {}).get("worker_output") or "")
+    for marker in HOST_CONDITION_MARKERS:
+        if any(marker in text for text in haystack):
+            return marker
+    return None
+
+
+def _host_condition_retries(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many spared host-condition retries this task has had in the last hour."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'host_condition_retry' "
+        "  AND created_at >= ?",
+        (task_id, int(time.time()) - HOST_CONDITION_RETRY_WINDOW_SECONDS),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
@@ -1301,6 +1350,20 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
+            marker = _host_condition_marker(dead)
+            if marker is not None:
+                spared = _host_condition_retries(conn, tid)
+                if spared < HOST_CONDITION_RETRY_LIMIT:
+                    # The card is already back at its source phase and its ``crashed``
+                    # event is durable; only the budget is spared, with an audit row.
+                    with _kb.write_txn(conn):
+                        _kb._append_event(
+                            conn, tid, "host_condition_retry",
+                            {"pid": pid, "marker": marker, "attempt": spared + 1},
+                        )
+                    continue
+                # Bound reached: a card that only ever meets host conditions is booked
+                # as a normal crash from here on, so it cannot loop forever.
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
             if is_systemic:
