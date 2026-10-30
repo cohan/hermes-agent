@@ -161,10 +161,21 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     """Restore only while holding the destination authority's maintenance reservation.
 
     Returns ``False``, without touching *dst*, when *src* fails the SQLite
-    integrity check, when the runtime owns the profile, or when a canonical
-    ``state.db`` epoch floor cannot be proven.
+    integrity check, when the runtime owns the profile, when a canonical
+    ``state.db`` epoch floor cannot be proven, or when *dst* is a kanban board
+    with cards still in flight.
+
+    A board restore is a page-level rewrite of the file the dispatcher and its
+    workers are writing. Restoring it under a ``running`` card or a held
+    ``claim_lock`` re-instates pages that predate the claim: the worker keeps
+    running against a board that no longer records it, and its run is stranded.
+    ``kanban_quiesce`` names the blocking cards so the operator knows what to
+    stop; the merge path publishes by atomic rename instead because it runs
+    with no holder at all, while a restore must also work when the gateway is
+    up (it keeps the inode, so open connections converge — #65942).
     """
     from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance
+    from hermes_cli import kanban_quiesce
     from hermes_cli.backup import verify_sqlite_integrity
 
     # backup() copies pages without validating their contents; its fallback
@@ -174,6 +185,18 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     if not source_check["valid"]:
         logger.error("Refusing SQLite restore from %s: %s", src, source_check["message"])
         return False
+
+    blockers = kanban_quiesce.board_in_flight(dst)
+    if blockers is not None:
+        # None means "not a kanban board"; an empty list means "quiesced".
+        if blockers:
+            logger.error(
+                "Refusing to restore the kanban board %s: %d card(s) still in flight — %s. "
+                "A restore rewrites the live board under running workers. Wait for them to "
+                "exit, or park them, then re-run the restore.",
+                dst, len(blockers), kanban_quiesce.describe_blockers(blockers),
+            )
+            return False
     try:
         with exclusive_maintenance([dst.absolute().parent, dst.resolve().parent]):
             with _restore_epoch_source(src, dst) as prepared:
