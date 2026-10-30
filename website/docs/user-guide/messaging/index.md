@@ -951,6 +951,25 @@ use their turn policy; independent notifications and deferred deliveries evaluat
 policy at their own delivery boundary. Already delivered messages are not removed.
 Suppression does not fix an underlying failure or add another logging destination.
 
+### Kanban attention-only notifications (opt-in)
+
+Set `display.platforms.telegram.kanban_attention_only: true` to keep only review
+requests, requested changes, and `needs_input` blocks (including block-loop
+escalations) as Kanban text notifications on Telegram. Other card events,
+including completion and diagnostic notices, produce no text ping. This gate
+works independently of `suppress_warning_notifications`.
+
+Completion deliverables still upload as native files, without a completion text
+message. The existing artifact discovery, media policy and best-effort upload
+behavior are unchanged. Notification cursors advance for suppressed events;
+origin-agent wakes are not filtered by this setting.
+
+The default is `false` (existing behavior). Set it back to `false` to restore
+completion text; the separate warning setting still applies. Like other display
+settings, `display.kanban_attention_only` is a global default, per-platform values
+override it, and `null` inherits. The notifier reads the subscriber profile's
+effective config at delivery time.
+
 ### Progress bubble cleanup (opt-in)
 
 Tool-progress messages, the "still working…" heartbeat, and status-callback bubbles can also be auto-deleted after the final response lands. Enable per-platform via `display.platforms.<platform>.cleanup_progress`:

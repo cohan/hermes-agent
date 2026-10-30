@@ -727,8 +727,8 @@ class _KanbanNotification:
                                notification_category="diagnostic" if self.wake_diagnostic else "result")
         self._log_woke()
 
-    async def _send_event(self, ev: Any, msg: str) -> bool:
-        """Send one text ping; raises on adapter exception or SendResult(success=False)."""
+    async def _send_event(self, ev: Any, msg: Optional[str]) -> bool:
+        """Send optional text and handoff files; muted completion text must not drop files."""
         from gateway.warning_notifications import present_notification
         sub, adapter = self.sub, self.adapter
         delivery_metadata = sub.get("delivery_metadata")
@@ -739,14 +739,16 @@ class _KanbanNotification:
         async def send_ping():
             nonlocal _send_res
             _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
-        if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
+        if msg is not None and not await present_notification(
+            send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev),
+        ):
             return False
         # SendResult(success=False) without an exception is a FAILED delivery
         # (else the event is lost); None / non-SendResult keeps the
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
-        logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
+        logger.debug("kanban notifier: processed %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
         # Upload artifact paths from the handoff payload / legacy result as
         # native files. Both handoff kinds stage files for exactly this: a
@@ -813,6 +815,11 @@ class _KanbanNotification:
 
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
+        from gateway.display_config import resolve_display_setting
+        from gateway.warning_notifications import effective_user_config
+        attention_only = resolve_display_setting(
+            effective_user_config(), self.platform_str, "kanban_attention_only", False,
+        )
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
@@ -828,6 +835,13 @@ class _KanbanNotification:
                 logger.warning(
                     "kanban notifier: tablet refused notice for %s; falling back to telegram", self.task_id,
                 )
+            if attention_only and not (
+                ev.kind in {"review_requested", "changes_requested"}
+                or (ev.kind in {"blocked", "block_loop_detected"}
+                    and (ev.payload or {}).get("kind") == "needs_input")
+            ):
+                # Still process artifacts and record the ping cursor, including on wake retries.
+                msg = None
             # Non-push adapters (api_server) always report SendResult(success=False)
             # from send(); treating that as failure would drop the sub forever and
             # make the wake path unreachable. Skip the doomed send; the self-post
