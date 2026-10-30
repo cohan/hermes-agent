@@ -65,6 +65,8 @@ async def test_stalled_long_poll_hands_off_to_supervisor():
     recovery = AsyncMock()
     with patch.object(adapter, "_handle_polling_network_error", new=recovery):
         await adapter._check_polling_stall()
+        assert adapter._polling_error_task is None
+        await adapter._check_polling_stall()
     task = adapter._polling_error_task
     assert task is not None
     await task
@@ -95,6 +97,8 @@ async def test_confirmed_stall_hands_off_before_reusing_updater(monkeypatch, via
                 monkeypatch.setattr(tg_adapter, "_POLLING_PROGRESS_TIMEOUT", 0)
                 await adapter._verify_polling_after_reconnect(generation, progress)
             else:
+                await adapter._check_polling_stall()
+                assert adapter._polling_error_task is None
                 await adapter._check_polling_stall()
             task = adapter._polling_error_task
             assert task is not None
@@ -156,6 +160,8 @@ async def test_generation_with_no_progress_ever_uses_generation_age():
     recovery = AsyncMock()
     with patch.object(adapter, "_handle_polling_network_error", new=recovery):
         await adapter._check_polling_stall()
+        assert adapter._polling_error_task is None
+        await adapter._check_polling_stall()
     task = adapter._polling_error_task
     assert task is not None
     await task
@@ -191,8 +197,8 @@ async def test_heartbeat_detects_wedged_long_poll_with_empty_queue():
     """End-to-end (#92991): drive the lifetime heartbeat loop against a
     wedged poller with a healthy general path and an empty queue. Before the
     stall watchdog, this setup produces total silence — no probe fires and
-    no recovery is ever scheduled. After it, the first stall observation
-    escalates through the reconnect ladder."""
+    no recovery is ever scheduled. After two stale observations the watchdog
+    escalates through the recovery path."""
     adapter = _make_adapter(stalled_seconds=400)
     real_sleep = asyncio.sleep
 

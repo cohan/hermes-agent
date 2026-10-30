@@ -475,6 +475,8 @@ _POLLING_PROGRESS_TIMEOUT = 60.0  # generation unhealthy until getUpdates return
 # #92991) and no other probe can see it. ~3x the worst-case poll window leaves ample margin against false
 # positives while still recovering within a few heartbeat intervals.
 _POLLING_STALL_TIMEOUT = 150.0
+# Require two stale heartbeats, not a single delayed probe, before a rebuild.
+_POLLING_STALL_HEARTBEATS = 2
 # Ingress dispatch stall (#102260, #130407): the transport probes prove getUpdates round-trips complete, not
 # that PTB's dispatcher ever handed the fetched updates to a handler. A backlog with no dispatch progress for
 # four heartbeats (360s) hands the adapter to the supervisor for a rebuild (an in-place restart keeps the
@@ -673,6 +675,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # Consecutive heartbeat probes seeing queued updates the poller isn't consuming (get_me() can't
         # see a wedged getUpdates) / finding the updater stopped with no reconnect in flight; escalate after two.
         self._polling_pending_stuck_count = self._polling_not_running_count = 0
+        # Consecutive heartbeat probes whose getUpdates round-trip is stale past _POLLING_STALL_TIMEOUT with
+        # NO handler in flight; the supervisor hand-off waits for _POLLING_STALL_HEARTBEATS of them.
+        self._polling_stall_heartbeats: int = 0
         # Degraded until getUpdates makes progress; while True, send() short-circuits to failure so callers
         # (cron live-adapter branch) fall through to standalone delivery.
         # Consecutive heartbeat probes that saw queued updates the running poller is not consuming. get_me()
@@ -1695,6 +1700,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # update_queue, so old dispatches can briefly exceed received; the check treats that as no backlog.
         self._updates_received_total = self._updates_dispatched_total = 0
         self._ingress_dispatched_seen = self._ingress_stalled_heartbeats = 0
+        # A fresh generation starts with no proven round-trip: the stall watchdog must earn its probes again.
+        self._polling_stall_heartbeats = 0
         return self._polling_generation, self._polling_progress_event
 
     def _record_polling_progress(self, generation: int) -> bool:
@@ -1708,6 +1715,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             logger.info("[%s] Telegram polling %s: getUpdates progressing (generation %d)", self.name, state, generation)
         self._polling_progress_event.set()
         self._polling_last_progress_monotonic = time.monotonic()
+        # A completed round-trip proves the consumer is alive: re-arm the stall watchdog.
+        self._polling_stall_heartbeats = 0
         self._polling_network_error_count = 0
         if generation == self._polling_conflict_recovery_generation:
             self._polling_conflict_recovery_generation = None
@@ -1859,6 +1868,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     def _recovery_in_flight(self) -> bool:
         return bool(self._polling_error_task and not self._polling_error_task.done())
+
+    def _turn_in_flight(self) -> bool:
+        """PTB callbacks and detached gateway session tasks both own inbound work.
+
+        Received/dispatched counters cannot track completion. Core handlers return
+        after spawning session work, so admission claims alone are insufficient.
+        """
+        return bool(self._inflight_update_ids) or any(
+            not task.done() for task in self._session_tasks.values()
+        )
 
     def _schedule_polling_recovery(self, error: Exception, *, reason: str) -> None:
         """Schedule background polling recovery without failing gateway startup: a transient bootstrap
@@ -2197,6 +2216,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         request path, so the CLOSE-WAIT heartbeat never fires — yet DMs queue in the Bot API and never reach
         handlers (#42909).
         We detect the stopped updater directly and feed the same ladder (#55769).
+
+        Pending server-side updates alone do not justify recovery while inbound
+        work is running. Defer this destructive action; do not infer that the
+        session turn caused a wire stall (polling runs independently).
         """
         # Polling mode only: in webhook mode Telegram pushes and holds no server-side queue.
         if self._teardown_started or self._webhook_mode:
@@ -2239,6 +2262,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return  # connectivity symptom for the get_me() path, not a stuck-queue signal
         pending = int(getattr(info, "pending_update_count", 0) or 0)
         if pending <= 0:
+            self._polling_pending_stuck_count = 0
+            return
+        if self._turn_in_flight():
+            logger.info(
+                "[%s] Telegram polling heartbeat: %d pending update(s); "
+                "deferring recovery while inbound work is in flight", self.name, pending)
             self._polling_pending_stuck_count = 0
             return
         self._polling_pending_stuck_count += 1
@@ -2293,8 +2322,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     async def _check_polling_stall(self) -> None:
         """Watchdog the last successful getUpdates round-trip: a long-poll can wedge without raising
         (CLOSE-WAIT after a route flip) while every other probe stays blind; no round-trip for
-        ``_POLLING_STALL_TIMEOUT`` ⇒ raise ``_PollingStallError`` so the recovery path hands the
-        adapter to the supervisor for a rebuild instead of reusing the wedged Updater.
+        ``_POLLING_STALL_TIMEOUT`` across ``_POLLING_STALL_HEARTBEATS`` consecutive probes with no handler in
+        flight ⇒ raise ``_PollingStallError`` so the recovery path hands the adapter to the supervisor for a
+        rebuild instead of reusing the wedged Updater.
+
+        A stale wire stamp remains evidence of a transport stall even mid-turn.
+        Defer rebuilding until inbound work ends, then require two stale probes.
+        Any completed round-trip resets that evidence.
 
         See #92991, #113618.
         """
@@ -2312,8 +2346,21 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return
         if stalled_for <= _POLLING_STALL_TIMEOUT:
             return
-        # No pre-log here: the recovery path logs the hand-off and ``_go_fatal_network`` the one
-        # error-level line, so a stall does not announce itself twice.
+        if self._turn_in_flight():
+            # Preserve the wire-stall signal but avoid tearing down active work.
+            logger.info(
+                "[%s] Telegram polling heartbeat: no getUpdates progress for %.0fs but a handler is in "
+                "flight; deferring the stall hand-off until the turn ends", self.name, stalled_for)
+            self._polling_stall_heartbeats = 0
+            return
+        # No pre-log for the escalation itself: the recovery path logs the hand-off and ``_go_fatal_network``
+        # the one error-level line, so a stall does not announce itself twice.
+        self._polling_stall_heartbeats = getattr(self, "_polling_stall_heartbeats", 0) + 1
+        if self._polling_stall_heartbeats < _POLLING_STALL_HEARTBEATS:
+            logger.info(
+                "[%s] Telegram polling heartbeat: no getUpdates progress for %.0fs (stall probe %d/%d)",
+                self.name, stalled_for, self._polling_stall_heartbeats, _POLLING_STALL_HEARTBEATS)
+            return
         self._schedule_polling_recovery(
             _PollingStallError(
                 f"getUpdates made no progress for {stalled_for:.0f}s (generation {getattr(self, '_polling_generation', 0)}; polling stall watchdog)"),
