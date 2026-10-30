@@ -345,6 +345,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[nous|local]"),
 
     # Exit
+    CommandDef("end", "End this session (marks it ended), then exit", "Exit",
+               cli_only=True, aliases=("bye",), desktop="terminal"),
     CommandDef("quit", "Exit the CLI (use --delete to also remove session history)", "Exit",
                cli_only=True, aliases=("exit",), args_hint="[--delete]", desktop="terminal")]
 

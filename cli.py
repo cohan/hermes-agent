@@ -1112,7 +1112,8 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
     # ``_handle_<name>_command(cmd)``. Looked up via getattr at dispatch time so
     # monkeypatching works. A handler returning False exits the REPL.
     _SLASH_DISPATCH: dict[str, tuple[str, bool]] = {
-        "exit": ("_cmd_exit", True), "quit": ("_cmd_exit", True), "help": ("_cmd_help", True),
+        "exit": ("_cmd_exit", True), "quit": ("_cmd_exit", True), "end": ("_cmd_end", True),
+        "help": ("_cmd_help", True),
         "palette": ("_open_command_palette", False), "whoami": ("_handle_whoami_command", False),
         "profile": ("_handle_profile_command", False), "toolsets": ("show_toolsets", False),
         "config": ("show_config", False), "redraw": ("_cmd_redraw", True), "clear": ("_cmd_clear", True),

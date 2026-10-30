@@ -2174,6 +2174,36 @@ def _(rid, params: dict, session: dict) -> dict:
     return _ok(rid, {"file": str(path)})
 
 
+@method("session.end")
+def _(rid, params: dict) -> dict:
+    """Mark the session deliberately ended (``end_reason='user_end'``) for the TUI's ``/end``, WITHOUT
+    tearing the runtime down — the client exits right after and its shutdown teardown then re-stamps
+    ``tui_shutdown``, which ``end_session`` ignores (first reason wins). Stamping here rather than at
+    teardown is what makes the reason right even when the exit is a SIGKILL, and it is the difference
+    ``/exit`` does not make: ``user_end`` is a deliberate boundary, not an automatic "the runtime went
+    away", so recovery never resurrects the row as an accident. Also records the reason on the live
+    runtime for a row that does not exist yet (a fresh session no turn has persisted), which the
+    teardown then uses instead of its own automatic one.
+    """
+    target = str(params.get("session_id") or params.get("session_key") or "")
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    session = _sessions.get(target)
+    if session is not None:
+        session["_end_reason_override"] = "user_end"
+    with (_session_db(session) if session is not None else _profile_db(params, writer=True)) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5007)
+        # agent.session_id, not the key: after compression the key can be the stale ended parent
+        # while session_id is the live continuation (same rule as _finalize_session).
+        session_id = getattr(session.get("agent") if session is not None else None, "session_id", None) or target
+        try:
+            db.end_session(str(session_id), "user_end")
+        except Exception as e:
+            return _err(rid, 5007, str(e))
+        return _ok(rid, {"ended": True, "end_reason": "user_end", "session_id": str(session_id)})
+
+
 @method("session.close")
 def _(rid, params: dict) -> dict:
     with _session_resume_lock:  # lock only the ownership claim; finalization must not block resumes

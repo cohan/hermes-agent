@@ -87,6 +87,29 @@ class CLILoopsMixin:
             return True
         return False
 
+    def _cmd_end(self, cmd_original: str):
+        """``/end`` — end THIS session deliberately, then exit.
+
+        ``/exit`` only quits; the shutdown path stamps the automatic ``cli_close`` (recoverable,
+        i.e. a runtime that vanished).  ``/end`` stamps ``end_reason='user_end'`` first — a
+        deliberate boundary, so nothing later treats the row as an accident.  ``end_session`` is
+        first-reason-wins, so the automatic stamp the exit path writes afterwards is a no-op.
+        """
+        import contextlib as _contextlib
+        session_id = getattr(self, "session_id", None)
+        db = getattr(self, "_session_db", None)
+        if db is not None and session_id:
+            agent = getattr(self, "agent", None)
+            if agent is not None:
+                with _contextlib.suppress(Exception):
+                    # Persist the final turn before the row closes, the /new contract (#47202):
+                    # /end can arrive mid-turn, before _flush_messages_to_session_db() ran.
+                    agent._flush_messages_to_session_db(
+                        self.conversation_history, conversation_history=self.conversation_history)
+            with _contextlib.suppress(Exception):
+                db.end_session(session_id, "user_end")
+        return False
+
     def _cmd_help(self, cmd_original: str):
         from cli import _slash_args
         self.show_help(_slash_args(cmd_original))

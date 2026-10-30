@@ -161,6 +161,39 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    aliases: ['bye'],
+    help: 'end this session (marks it ended) and exit hermes',
+    name: 'end',
+    run: (_arg, ctx) => {
+      // Same dashboard refusal as /quit: the hosted chat has no in-page restart after the PTY
+      // child exits. Ending the session would be recorded here but the tab would be bricked.
+      if (DASHBOARD_TUI_MODE) {
+        ctx.transcript.sys(t('slashCmd.core.quit.dashboardDisabled'))
+
+        return
+      }
+
+      // Mark the row ended as the DELIBERATE 'user_end' before this process goes away: the
+      // shutdown teardown would otherwise stamp the automatic 'tui_shutdown' (its class is
+      // "the runtime vanished", which recovery may resurrect). end_session is first-reason-wins,
+      // so the teardown stamp becomes the no-op. A slow or failed RPC must still exit — the
+      // timer is the fallback — and `left` keeps die() to one call.
+      let left = false
+      const leave = () => {
+        if (left) {
+          return
+        }
+
+        left = true
+        ctx.session.die()
+      }
+
+      setTimeout(leave, 1500)
+      ctx.gateway.rpc('session.end', { session_id: ctx.sid }).then(leave, leave)
+    }
+  },
+
+  {
     help: 'update Hermes Agent to the latest version (exits TUI)',
     name: 'update',
     run: (_arg, ctx) => {

@@ -433,6 +433,11 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
+    # `/end` (session.end) records the reason the user ended the session deliberately; it wins over
+    # the automatic one this teardown carries (tui_shutdown), so the row reads as a boundary the user
+    # made rather than an accident. Substituted before the automatic-cleanup classification below,
+    # which must not treat a deliberate end as reclaim-only (#105588).
+    end_reason = session.get("_end_reason_override") or end_reason
     _lock_vault_managers(session)
     if (history_ready := session.get("resume_history_ready")) is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
