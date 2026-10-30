@@ -883,6 +883,12 @@ def _poll_sequential_future(agent, future, function_name: str, deadline: float |
         if deadline is not None:
             remaining = deadline + authorization_gate.excluded_seconds() - time.monotonic()
             if remaining <= 0:
+                # A worker that already FINISHED is not a timeout. The deadline bounds how long this
+                # runner waits, never the disposition of work that already completed: reading the
+                # settled outcome here keeps the result and output the worker produced. Without this
+                # the expiry branch reported a bare timeout and discarded a result it already held.
+                if future.done():
+                    return "done", future.result()
                 return "timeout", None
             wait_slice = min(wait_slice, remaining)
         try:
@@ -977,7 +983,16 @@ def _run_sequential_tool_execution_middleware(
             )
         else:
             assert timeout_s is not None  # only reachable when a deadline exists
-            message = f"Error executing tool '{function_name}': timed out after {timeout_s:.1f}s"
+            # Honest abandonment: the deadline expired with the worker still running, so this call's
+            # outcome is UNKNOWN. The worker is abandoned (never joined) and its eventual result is
+            # discarded, so say that instead of implying the command failed. An expired call whose
+            # worker had already settled never reaches this branch (see ``_poll_sequential_future``).
+            message = (
+                f"Error executing tool '{function_name}': timed out after {timeout_s:.1f}s"
+                " - its outcome is not available: the call may still be running (it was abandoned,"
+                " not killed) and any result it produces now is discarded. Treat its side effects as"
+                " unknown: inspect before re-running, and prefer background execution for long jobs."
+            )
             logger.warning("sequential tool %s timed out after %.1fs", function_name, timeout_s)
             result_cls, outcome = _ToolTimeoutResult, dict(
                 duration_ms=int(timeout_s * 1000), status="timeout", error_type="tool_timeout", error_message=message,
