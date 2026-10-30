@@ -7582,6 +7582,14 @@ def _credential_rung_accepts(exc: Exception) -> bool:
     return _is_auth_error(exc) or _is_payment_error(exc) or _is_rate_limit_error(exc)
 
 
+def _should_retry_rate_limited_same_key(exc: Exception) -> bool:
+    """Allow the pool probe only when the provider gave no cooldown to honor."""
+    if not _is_rate_limit_error(exc) or _is_payment_error(exc):
+        return False
+    from agent.retry_utils import provider_retry_after_seconds
+    return provider_retry_after_seconds(exc) is None
+
+
 # Immutable route context shared by the recovery rungs.
 class _LadderRoute(NamedTuple):
     client: Any
@@ -7778,13 +7786,20 @@ def _ladder_credential_rungs(
     # is skipped and ``first_err`` is handed to the provider-fallback chain as-is.
     if pool_provider and _credential_rung_accepts(first_err):
         recovery_err = first_err
-        # Skip the extra retry for clear payment/quota errors — the endpoint won't accept
-        # another request with the same exhausted key.
-        if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
+        # A provider-declared cooldown is authoritative. Retrying the same key immediately
+        # after a 429 turns one refusal into a request burst (especially for vision calls).
+        # With no Retry-After, retain the historical one-retry pool probe; an explicit
+        # cooldown instead falls through to rotation/fallback without another same-key call.
+        if _should_retry_rate_limited_same_key(first_err):
             resp, recovery_err = yield from _rung(
                 _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
             if recovery_err is None:
                 return resp, None
+        elif _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
+            logger.info(
+                "Auxiliary %s%s: honoring provider Retry-After; skipping same-key retry",
+                task or "call", tag,
+            )
         if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
             logger.info("Auxiliary %s%s: recovered %s via credential-pool rotation after %s",
                         task or "call", tag, pool_provider, type(recovery_err).__name__)
