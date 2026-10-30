@@ -29,6 +29,7 @@ from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
     _resolve_dispatcher_settings,
+    apply_live_caps,
 )
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -210,8 +211,8 @@ class GatewayKanbanWatchersMixin:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.
 
         Config is read once at boot (restart to apply), except the auto-decompose
-        toggle which is re-read every tick. The env var is an escape hatch to
-        disable without editing YAML.
+        toggle and the concurrency caps, which are re-read every tick. The env
+        var is an escape hatch to disable without editing YAML.
         """
         try:
             from hermes_cli.config import load_config as _load_config
@@ -302,6 +303,12 @@ class GatewayKanbanWatchersMixin:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
                     _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
+                    # Same for the concurrency caps: a cap edited into
+                    # config.yaml must bind on the next tick, or the written
+                    # number and the enforced one drift apart silently and the
+                    # host is over-subscribed by a setting it reports as applied
+                    # (t_7ac518e1: the file said 1, the gateway held 4).
+                    apply_live_caps(dispatcher, _load_config)
                     # See #49638.
                     if _ad_enabled:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)

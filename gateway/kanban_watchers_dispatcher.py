@@ -32,7 +32,12 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """``kanban.*`` dispatch settings, read once at boot (restart to apply).
+
+    Exception: the concurrency caps (``max_in_progress`` /
+    ``max_in_progress_per_profile``) are re-resolved every tick by
+    :func:`apply_live_caps`, so an edited cap binds without a restart.
+    """
 
     interval: float
     max_spawn: Any
@@ -115,6 +120,61 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+    )
+
+
+def _quiet_positive_int(kanban_cfg: dict, key: str) -> Optional[int]:
+    """``kanban.<key>`` as a positive int; ``None`` when unset or invalid (< 1).
+
+    Quiet twin of :func:`gateway.kanban_watchers_common._positive_int_setting`:
+    that helper logs on every call, and this one is re-run every tick.
+    """
+    raw = kanban_cfg.get(key)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 1 else None
+
+
+def apply_live_caps(dispatcher: "_KanbanDispatcher", load_config: Any) -> None:
+    """Re-resolve the concurrency caps from config and update *dispatcher* in place.
+
+    Mirrors :func:`hermes_cli.kanban_db_dispatch.run_daemon`, which re-resolves
+    ``kanban.max_in_progress`` every tick (the config load is mtime-cached).
+    The embedded dispatcher used to keep its boot values forever, so the number
+    written in ``config.yaml`` was not the number enforced — a cap of 1 edited
+    into the file while the gateway ran kept dispatching against the old 4
+    (t_7ac518e1), and the hub over-subscribed itself on the strength of a
+    setting it reported as applied.
+
+    Fails open: an unreadable config keeps the boot caps rather than dropping
+    the limit. Logs only when the effective caps actually change.
+    """
+    try:
+        kanban_cfg = (load_config() or {}).get("kanban") or {}
+    except Exception:
+        logger.debug("kanban dispatcher: cap re-read failed; keeping boot caps", exc_info=True)
+        return
+    kbd = _kbd()
+    # Explicit config wins; unset/invalid falls through to the memory-derived
+    # default, exactly like the boot path and the standalone daemon.
+    max_in_progress = kbd.resolve_max_in_progress(
+        _quiet_positive_int(kanban_cfg, "max_in_progress")
+    )
+    per_profile = _quiet_positive_int(kanban_cfg, "max_in_progress_per_profile")
+    settings = dispatcher.settings
+    previous = (settings.max_in_progress, settings.max_in_progress_per_profile)
+    if previous == (max_in_progress, per_profile):
+        return
+    settings.max_in_progress = max_in_progress
+    settings.max_in_progress_per_profile = per_profile
+    logger.info(
+        "kanban dispatcher: concurrency caps re-read from config: "
+        "max_in_progress=%s (was %s), max_in_progress_per_profile=%s (was %s)",
+        max_in_progress, previous[0], per_profile, previous[1],
     )
 
 
