@@ -127,6 +127,9 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    max_in_progress_reached: Optional[int] = None
+    """Total running tasks when the host-wide ``max_in_progress`` stopped
+    this tick before any lane-level skip bucket could be populated."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2351,6 +2354,7 @@ def _tick_spawn_budget(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.max_in_progress_reached = total_running
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
