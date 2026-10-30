@@ -135,16 +135,24 @@ async def test_unseen_redelivery_runs_once_then_receipt_dedupes_after_rebuild(tm
 
 
 @pytest.mark.asyncio
-async def test_accepted_but_cancelled_work_is_deduped_not_retried(tmp_path):
-    """Counterexample to blanket no-loss: admission is not durable completion."""
+async def test_accepted_then_cancelled_work_is_retried_after_rebuild(tmp_path):
+    """Admission is not durable completion: a cancelled turn is re-run, not deduped.
+
+    Regression guard for the gap disclosed by t_302b5652 and closed by t_300a9e1e: an
+    update admitted (``claim.accepted``) and then cancelled by a full gateway teardown used
+    to be recorded in the durable receipt set anyway, so a restarted gateway dropped
+    Telegram's redelivery and the work was lost with no retry. It must instead be recorded
+    as incomplete and re-run.
+    """
     entered = asyncio.Event()
     never = asyncio.Event()
-    completed = []
+    calls = []
 
     async def callback(update, context):
-        entered.set()
-        await never.wait()
-        completed.append(update.update_id)
+        calls.append(update.update_id)
+        if len(calls) == 1:
+            entered.set()
+            await never.wait()
 
     obj, app = receipt_app(tmp_path, callback)
     task = asyncio.create_task(app.process_update(Update(303)))
@@ -152,8 +160,16 @@ async def test_accepted_but_cancelled_work_is_deduped_not_retried(tmp_path):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await obj._update_receipt_flush
+    flush = obj._update_receipt_flush
+    if flush is not None:
+        await flush
+    assert calls == [303]
+    # Admitted, then cancelled, is recorded as incomplete -- never as completed history.
+    payload = json.loads((tmp_path / "telegram_update_receipts_111.json").read_text())
+    assert payload["update_ids"] == {}
+    assert "303" in payload["incomplete_ids"]
+    # Telegram redelivers the unacked update to a rebuilt adapter: it re-runs, not dropped.
     rebuilt, new_app = receipt_app(tmp_path, callback)
+    assert "111:303" not in rebuilt._seen_update_ids
     await asyncio.wait_for(new_app.process_update(Update(303)), 1)
-    assert completed == []
-    assert "111:303" in rebuilt._seen_update_ids
+    assert calls == [303, 303]

@@ -6,6 +6,12 @@ claims. Completed IDs are also written to a per-bot receipt file under the adapt
 Hermes home, so a replacement adapter or a restarted gateway still drops updates that
 Telegram redelivers because their getUpdates/webhook acknowledgement never landed.
 No cross-process coordination or exactly-once effects are promised.
+
+A receipt asserts durable completion, not mere admission. The receipt file therefore
+separates the two: ``update_ids`` are durably completed updates, while ``incomplete_ids``
+records an update that was admitted and then cancelled before it finished (the turn cut
+by a full gateway teardown). Only ``update_ids`` seed completed history, so a restarted
+gateway re-runs the redelivered incomplete update instead of dropping the work.
 """
 
 import asyncio
@@ -63,10 +69,25 @@ def _load_receipts(adapter, bot_id) -> None:
         key = f"{bot_id}:{uid}"
         if key not in seen:
             bounded_put(seen, key, ts, _SEEN_CAP)
+    # Admitted-but-unfinished ids are recorded durably but never seeded into ``seen``: Telegram's
+    # redelivery of the work that was cancelled mid-turn must be re-run, not deduped away.
+    unfinished = payload.get("incomplete_ids")
+    if isinstance(unfinished, dict):
+        for uid, ts in unfinished.items():
+            if isinstance(ts, (int, float)) and ts > cutoff and str(uid).lstrip("-").isdigit():
+                bounded_put(adapter._update_receipts_incomplete, f"{bot_id}:{uid}", float(ts), _SEEN_CAP)
 
 
-def _record_receipt(adapter, key: str) -> None:
-    bounded_put(adapter._seen_update_ids, key, time.time(), _SEEN_CAP)
+def _record_receipt(adapter, key: str, durable: bool = True) -> None:
+    """Record an admitted update. ``durable`` marks genuine completion: only durable ids are
+    persisted as completed history, so a non-durable one (cancelled mid-turn) is re-run after
+    a gateway restart rather than deduped away. Both stay in the in-process ``seen`` set."""
+    now = time.time()
+    bounded_put(adapter._seen_update_ids, key, now, _SEEN_CAP)
+    if durable:
+        adapter._update_receipts_incomplete.pop(key, None)
+    else:
+        bounded_put(adapter._update_receipts_incomplete, key, now, _SEEN_CAP)
     adapter._update_receipts_dirty.add(key.split(":", 1)[0])
     task = adapter._update_receipt_flush
     if task is None or task.done():
@@ -81,13 +102,17 @@ async def _flush_receipts(adapter) -> None:
     while adapter._update_receipts_dirty:
         bot_id = adapter._update_receipts_dirty.pop()
         prefix, cutoff = f"{bot_id}:", time.time() - RECEIPT_TTL_SECONDS
-        # Snapshot on the loop: admission mutates this dict only from loop callbacks.
+        # Snapshot on the loop: admission mutates these dicts only from loop callbacks.
+        unfinished = {key[len(prefix):]: ts for key, ts in adapter._update_receipts_incomplete.items()
+                      if key.startswith(prefix) and isinstance(ts, float) and ts > cutoff}
         ids = {key[len(prefix):]: ts for key, ts in adapter._seen_update_ids.items()
-               if key.startswith(prefix) and isinstance(ts, float) and ts > cutoff}
+               if key.startswith(prefix) and isinstance(ts, float) and ts > cutoff
+               and key[len(prefix):] not in unfinished}
         path = _receipt_path(adapter, bot_id)
         try:
             mkdir_under_hermes_home(path.parent)
-            await asyncio.to_thread(atomic_json_write, path, {"update_ids": ids}, indent=None)
+            await asyncio.to_thread(atomic_json_write, path,
+                                    {"update_ids": ids, "incomplete_ids": unfinished}, indent=None)
         except Exception:
             logger.warning("[Telegram] Failed to persist update receipts to %s", path, exc_info=True)
 
@@ -99,6 +124,9 @@ class _Claim:
     accepted: bool = False
     completed: bool = False
     failed: bool = False
+    # A cancelled turn was admitted but never completed, so it must not be recorded as
+    # durably completed (see _release_claim).
+    cancelled: bool = False
     owners: int = 1
 
 
@@ -260,12 +288,20 @@ class TelegramApplication(Application):
     def _release_claim(self, claim, task=None):
         if task is not None and task.cancelled():
             claim.failed = True
+            # A task cancelled after the claim already completed is teardown noise, not lost
+            # work; only an interrupted claim becomes non-durable.
+            if not claim.completed:
+                claim.cancelled = True
         claim.owners -= 1
         if claim.owners:
             return
         del self.adapter._inflight_update_ids[claim.key]
+        # ``accepted`` covers a native plugin whose group ran to completion before its handler
+        # stopped; ``completed and not failed`` is the ordinary settled handoff. Either way the
+        # update is recorded, but only a non-cancelled claim counts as *durable* completion: a
+        # turn cut mid-flight (full gateway teardown) must be re-run after a restart, not dropped.
         if claim.accepted or (claim.completed and not claim.failed):
-            _record_receipt(self.adapter, claim.key)
+            _record_receipt(self.adapter, claim.key, durable=not claim.cancelled)
 
     async def process_error(self, update, error, job=None, coroutine=None):
         claim = self._current_claim.get()
@@ -294,6 +330,13 @@ class TelegramApplication(Application):
         token = self._current_claim.set(claim)
         try:
             await super().process_update(update)
+        except asyncio.CancelledError:
+            # A cancelled turn (gateway teardown) is admitted-but-unfinished: record it as
+            # cancelled so the claim earns no durable receipt and redelivery re-runs it.
+            claim.failed = True
+            if not claim.completed:
+                claim.cancelled = True
+            raise
         except BaseException:
             claim.failed = True
             raise

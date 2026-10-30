@@ -597,6 +597,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._update_receipt_dir = get_hermes_home()
         self._update_receipts_loaded: set = set()
         self._update_receipts_dirty: set = set()
+        # Admitted-but-unfinished update IDs (the turn was cancelled mid-flight). They are kept
+        # out of the persisted durable set so a restarted gateway re-runs them instead of
+        # dropping the work (update_admission.py::_record_receipt).
+        self._update_receipts_incomplete: dict = {}
         self._update_receipt_flush: Optional[asyncio.Task] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
