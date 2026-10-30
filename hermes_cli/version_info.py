@@ -12,9 +12,11 @@ Resolution order:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import time
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
@@ -205,15 +207,7 @@ def _stamp_version_info() -> VersionInfo | None:
 # --- Git provenance (source/dev installs) -----------------------------------
 
 
-def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> VersionInfo:
-    commit = _run_git(repo_dir, "rev-parse", "HEAD")
-    # A detached HEAD has no branch. Leave the field None: every formatter
-    # already prints the commit separately and handles a missing branch.
-    branch = _run_git(repo_dir, "branch", "--show-current")
-    commit_date_raw = _run_git(repo_dir, "log", "-1", "--format=%ct", "HEAD")
-    commit_date: int | None = None
-    if commit_date_raw and commit_date_raw.isdigit():
-        commit_date = int(commit_date_raw)
+def _working_tree_dirty(repo_dir: Path, *, include_untracked: bool = False) -> bool:
     try:
         # -uno: skip the untracked-file scan. This runs on the startup-banner
         # path, and a full working-tree walk costs real time on large or cold
@@ -233,9 +227,29 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
             cwd=str(repo_dir),
             check=False,
         )
-        dirty = dirty_result.returncode == 0 and bool((dirty_result.stdout or "").strip())
+        return dirty_result.returncode == 0 and bool((dirty_result.stdout or "").strip())
     except (OSError, subprocess.SubprocessError):
-        dirty = False
+        return False
+
+
+def _display_version_for(info: VersionInfo, dirty: bool) -> str:
+    """Re-derive ``display_version`` when only the dirty flag changed."""
+    short_commit = info.commit[:7] if info.commit else None
+    if info.base_version == "unknown" and short_commit:
+        return f"git.{short_commit}{'.dirty' if dirty else ''}"
+    return _derived_version(info.base_version, info.distance, dirty, short_commit)
+
+
+def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> VersionInfo:
+    commit = _run_git(repo_dir, "rev-parse", "HEAD")
+    # A detached HEAD has no branch. Leave the field None: every formatter
+    # already prints the commit separately and handles a missing branch.
+    branch = _run_git(repo_dir, "branch", "--show-current")
+    commit_date_raw = _run_git(repo_dir, "log", "-1", "--format=%ct", "HEAD")
+    commit_date: int | None = None
+    if commit_date_raw and commit_date_raw.isdigit():
+        commit_date = int(commit_date_raw)
+    dirty = _working_tree_dirty(repo_dir, include_untracked=include_untracked)
 
     tags = _run_git(repo_dir, "tag", "--merged", "HEAD", "--list", "v[0-9]*")
     releases = [
@@ -263,6 +277,185 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
     )
 
 
+# --- Disk cache for the git probe -------------------------------------------
+# A checkout's git identity only changes on a commit, a checkout, or an update,
+# but the probe shells out to git six or more times and the CLI start path runs
+# it in every new process (pm/worker.py included). On a small host that keeps
+# cores warm permanently. Cache the resolved identity, keyed on a stat-only
+# signature of the git metadata it depends on, so the steady state spawns no
+# git at all. The dirty flag is the one field that can change without touching
+# git metadata (editing a tracked file does not update .git/index), so it is
+# re-checked on a longer interval of its own and the rest is served from disk.
+
+_GIT_CACHE_SCHEMA = 1
+_DIRTY_REFRESH_SECONDS = 900.0
+_git_cache_memo: tuple[str, tuple[str, ...], bool, VersionInfo] | None = None
+
+
+def _git_cache_path() -> Path:
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "cache" / "version_info.json"
+
+
+def _git_dir(repo_dir: Path) -> Path | None:
+    """The metadata directory, following a worktree/submodule ``.git`` file."""
+    marker = repo_dir / ".git"
+    try:
+        if marker.is_dir():
+            return marker
+        if marker.is_file():
+            text = marker.read_text(encoding="utf-8", errors="replace").strip()
+            if text.startswith("gitdir:"):
+                target = Path(text.split(":", 1)[1].strip())
+                return target if target.is_absolute() else (repo_dir / target).resolve()
+    except OSError:
+        return None
+    return None
+
+
+def _path_signature(path: Path, base: Path) -> str:
+    try:
+        st = path.stat()
+    except OSError:
+        return f"{-1}"
+    try:
+        name = str(path.relative_to(base))
+    except ValueError:
+        name = str(path)
+    return f"{name}:{st.st_mtime_ns}:{st.st_size}"
+
+
+def _git_signature(repo_dir: Path) -> tuple[str, ...] | None:
+    """Stat-only fingerprint of the inputs the git identity depends on.
+
+    Deliberately spawns no subprocess: HEAD, the refs (loose and packed), the
+    index (dirty flag) and pyproject.toml (CalVer fallback) cover every field
+    the probe produces except the working-tree contents themselves.
+    """
+    git_dir = _git_dir(repo_dir)
+    if git_dir is None:
+        return None
+    # A linked worktree's HEAD and index live in its own gitdir, while the refs
+    # and packed-refs it resolves against live in the common dir (commondir).
+    common_dir = git_dir
+    try:
+        raw = (git_dir / "commondir").read_text(encoding="utf-8", errors="replace").strip()
+        if raw:
+            candidate = Path(raw)
+            common_dir = candidate if candidate.is_absolute() else (git_dir / candidate).resolve()
+    except OSError:
+        pass
+    parts = [_path_signature(repo_dir / ".git", repo_dir)]
+    seen: set[Path] = set()
+    for directory in (git_dir, common_dir):
+        if directory in seen:
+            continue
+        seen.add(directory)
+        for name in ("commondir", "HEAD", "index", "packed-refs", "ORIG_HEAD"):
+            parts.append(_path_signature(directory / name, directory))
+        refs = directory / "refs"
+        try:
+            for path in sorted(refs.rglob("*")):
+                if path.is_file():
+                    parts.append(_path_signature(path, directory))
+        except OSError:
+            parts.append("refs:unreadable")
+    parts.append(_path_signature(repo_dir / "pyproject.toml", repo_dir))
+    return tuple(parts)
+
+
+def _info_to_json(info: VersionInfo) -> dict:
+    return {field: getattr(info, field) for field in VersionInfo.__dataclass_fields__}
+
+
+def _info_from_json(data: object) -> VersionInfo | None:
+    if not isinstance(data, dict):
+        return None
+    fields = VersionInfo.__dataclass_fields__
+    kwargs = {key: data[key] for key in fields if key in data}
+    if not {"base_version", "derived_version", "source"} <= set(kwargs):
+        return None
+    try:
+        return VersionInfo(**kwargs)  # type: ignore[arg-type]
+    except TypeError:
+        return None
+
+
+def _read_git_cache() -> dict | None:
+    try:
+        raw = _git_cache_path().read_text(encoding="utf-8-sig")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) and data.get("schema") == _GIT_CACHE_SCHEMA else None
+
+
+def _write_git_cache(repo_dir: Path, signature: tuple[str, ...], include_untracked: bool, info: VersionInfo) -> None:
+    payload = {
+        "schema": _GIT_CACHE_SCHEMA,
+        "repoDir": str(repo_dir),
+        "signature": list(signature),
+        "includeUntracked": include_untracked,
+        "dirtyCheckedAt": time.time(),
+        "info": _info_to_json(info),
+    }
+
+    # A plain temp-file + replace, not utils.atomic_json_write: importing utils
+    # drags the YAML stack onto the CLI start path this cache exists to keep cheap.
+    path = _git_cache_path()
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _git_version_info_cached(repo_dir: Path, *, include_untracked: bool = False) -> VersionInfo:
+    """``_git_version_info`` behind a disk cache that survives the process."""
+    global _git_cache_memo
+    signature = _git_signature(repo_dir)
+    if signature is None:
+        # Not a recognizable git dir (or unreadable): probe directly, no cache.
+        return _git_version_info(repo_dir, include_untracked=include_untracked)
+
+    memo = _git_cache_memo
+    if memo is not None and memo[0] == str(repo_dir) and memo[1] == signature and memo[2] == include_untracked:
+        return memo[3]
+
+    cached = _read_git_cache()
+    if (
+        cached is not None
+        and cached.get("repoDir") == str(repo_dir)
+        and tuple(cached.get("signature") or ()) == signature
+        and bool(cached.get("includeUntracked")) == include_untracked
+    ):
+        info = _info_from_json(cached.get("info"))
+        if info is not None:
+            checked_at = cached.get("dirtyCheckedAt")
+            age = time.time() - checked_at if isinstance(checked_at, (int, float)) else None
+            if age is not None and age < _DIRTY_REFRESH_SECONDS:
+                _git_cache_memo = (str(repo_dir), signature, include_untracked, info)
+                return info
+            dirty = _working_tree_dirty(repo_dir, include_untracked=include_untracked)
+            if dirty != info.dirty:
+                info = replace(info, dirty=dirty, display_version=_display_version_for(info, dirty))
+            _write_git_cache(repo_dir, signature, include_untracked, info)
+            _git_cache_memo = (str(repo_dir), signature, include_untracked, info)
+            return info
+
+    info = _git_version_info(repo_dir, include_untracked=include_untracked)
+    _write_git_cache(repo_dir, signature, include_untracked, info)
+    _git_cache_memo = (str(repo_dir), signature, include_untracked, info)
+    return info
+
+
 # --- Cache + public API -----------------------------------------------------
 
 _cached_version_info: VersionInfo | None = None
@@ -270,8 +463,9 @@ _cached_version_info: VersionInfo | None = None
 
 def _reset_version_info_cache() -> None:
     """Test-only cache reset."""
-    global _cached_version_info
+    global _cached_version_info, _git_cache_memo
     _cached_version_info = None
+    _git_cache_memo = None
 
 
 def get_version_info() -> VersionInfo:
@@ -295,7 +489,7 @@ def get_version_info() -> VersionInfo:
     if info is None:
         repo_dir = _resolve_repo_dir()
         if repo_dir is not None:
-            info = _git_version_info(repo_dir)
+            info = _git_version_info_cached(repo_dir)
 
     # 3. Unknown — no stamp, no git
     if info is None:

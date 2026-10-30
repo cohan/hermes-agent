@@ -300,3 +300,98 @@ def test_a_timed_out_status_probe_never_strands_index_lock(tmp_path):
     _git_version_info(tmp_path, include_untracked=True)
 
     assert not (tmp_path / ".git" / "index.lock").exists()
+
+
+# --- Disk cache for the git probe ------------------------------------------
+# The probe shells out to git 6-7 times and every CLI start ran it, so on a
+# small host `git tag --merged` was a permanent warm floor. The cache is keyed
+# on a stat-only signature of the git metadata; these tests pin the three
+# behaviours it must keep: no git in the steady state, invalidation on a new
+# commit, and a dirty flag that still refreshes.
+
+
+def _cache_repo(path: Path) -> Path:
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", *args],
+            cwd=path, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    path.mkdir(parents=True, exist_ok=True)
+    git("init", "-q")
+    (path / "pyproject.toml").write_text('[project]\nname = "hermes-agent"\nversion = "0.21.4"\n', encoding="utf-8")
+    git("add", "pyproject.toml")
+    git("commit", "-qm", "release")
+    git("tag", "v2026.9.21")
+    return path
+
+
+def _count_git(monkeypatch) -> list[int]:
+    from hermes_cli import version_info as vi
+
+    calls = [0]
+    real_run, real_dirty = vi._run_git, vi._working_tree_dirty
+
+    def counted_run(*args, **kwargs):
+        calls[0] += 1
+        return real_run(*args, **kwargs)
+
+    def counted_dirty(*args, **kwargs):
+        calls[0] += 1
+        return real_dirty(*args, **kwargs)
+
+    monkeypatch.setattr(vi, "_run_git", counted_run)
+    monkeypatch.setattr(vi, "_working_tree_dirty", counted_dirty)
+    return calls
+
+
+def test_cached_git_probe_spawns_no_git_when_the_tree_is_unchanged(tmp_path, monkeypatch):
+    from hermes_cli import version_info as vi
+
+    repo = _cache_repo(tmp_path / "repo")
+    calls = _count_git(monkeypatch)
+
+    cold = vi._git_version_info_cached(repo)
+    cold_calls = calls[0]
+    assert cold_calls >= 6, "the cold probe must still resolve the real identity"
+    assert cold.base_version == "0.21.4"
+
+    vi._reset_version_info_cache()  # a new process: no memo, only the disk cache
+    warm = vi._git_version_info_cached(repo)
+
+    assert calls[0] == cold_calls, "a warm probe must not shell out to git at all"
+    assert warm == cold
+
+
+def test_cached_git_probe_sees_a_new_commit(tmp_path, monkeypatch):
+    from hermes_cli import version_info as vi
+
+    repo = _cache_repo(tmp_path / "repo")
+    first = vi._git_version_info_cached(repo)
+
+    subprocess.run(["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "next"],
+                   cwd=repo, check=True, capture_output=True)
+    vi._reset_version_info_cache()
+    second = vi._git_version_info_cached(repo)
+
+    assert second.commit != first.commit
+    assert second.distance == first.distance + 1
+
+
+def test_cached_git_probe_refreshes_dirty_on_its_own_interval(tmp_path, monkeypatch):
+    """Editing a tracked file touches no git metadata, so the signature cannot
+    see it: dirty must be re-checked rather than served forever stale."""
+    from hermes_cli import version_info as vi
+
+    repo = _cache_repo(tmp_path / "repo")
+    clean = vi._git_version_info_cached(repo)
+    assert clean.dirty is False
+
+    (repo / "pyproject.toml").write_text('[project]\nname = "hermes-agent"\nversion = "0.21.5"\n', encoding="utf-8")
+    vi._reset_version_info_cache()
+    monkeypatch.setattr(vi, "_DIRTY_REFRESH_SECONDS", -1.0)  # the interval has elapsed
+    refreshed = vi._git_version_info_cached(repo)
+
+    assert refreshed.dirty is True
+    assert refreshed.commit == clean.commit, "only the dirty flag may change"
+    assert refreshed.distance == clean.distance
